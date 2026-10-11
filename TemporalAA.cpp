@@ -59,6 +59,13 @@ static bool readBuffer(ID3D11Buffer *b, void *out, UINT n) {
 }
 static bool enabled = true, internal = false, finished = false;
 static float historyWeight = .65f;
+static float blurStrength = .12f, jitterScale = .75f;
+struct PreparedDraw {
+    bool valid = false;
+    float projection[16]{};
+    D3D11_VIEWPORT viewport{};
+};
+static PreparedDraw preparedDraw;
 static UINT frame = 0;
 static bool historyValid = false;
 static float jitterX = 0, jitterY = 0;
@@ -66,6 +73,19 @@ static ID3D11Texture2D *history = nullptr;
 static ID3D11ShaderResourceView *historyView = nullptr;
 static ID3D11SamplerState *sampler = nullptr;
 static ID3D11Buffer *jitterBuffer = nullptr;
+static float uploadedProjection[16]{};
+static bool projectionUploaded = false;
+static unsigned projectionUploads = 0;
+// The private jitter buffer is written only here. Reuse identical contents
+// across draws; binding and restoring the native buffer remains per draw.
+static void uploadProjection(ID3D11DeviceContext *c, const float *projection) {
+    if (projectionUploaded && memcmp(uploadedProjection, projection, 64) == 0)
+        return;
+    oldUpdate(c, jitterBuffer, 0, nullptr, projection, 0, 0);
+    memcpy(uploadedProjection, projection, 64);
+    projectionUploaded = true;
+    ++projectionUploads;
+}
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *context = nullptr;
 static ID3D11DeviceContext1 *context1 = nullptr;
@@ -85,7 +105,7 @@ static bool cameraKnown = false;
 static UINT width = 0, height = 0;
 static DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 static const char *code = R"(
-cbuffer Resolve:register(b0){float weight,valid,jitterX,jitterY;};
+cbuffer Resolve:register(b0){float weight,valid,jitterX,jitterY;float blurStrength;float3 padding;};
 Texture2D<float4> scene:register(t0);Texture2D<float4> history:register(t1);SamplerState linearSampler:register(s0);
 float4 vs(uint id:SV_VertexID):SV_POSITION{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}
 float4 ps(float4 p:SV_POSITION):SV_TARGET{
@@ -102,7 +122,8 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
  float confidence=1-smoothstep(.035,lerp(.16,.30,thin),disagreement);
  float accumulation=lerp(weight,max(weight,.78),thin);
  // History is bounded to this frame's neighborhood and rejected on changes.
- old=clamp(old,lo,hi);return float4(lerp(current.rgb,old,accumulation*valid*confidence),current.a);
+ float3 filtered=lerp(current.rgb,(current.rgb*4+left+right+up+down)/8,blurStrength);
+ old=clamp(old,lo,hi);return float4(lerp(filtered,old,accumulation*valid*confidence),current.a);
 })";
 static float halton(UINT i, UINT base) {
     float f = 1, r = 0;
@@ -119,8 +140,8 @@ static void reset() {
     drop(target);
     finished = false;
     frame++;
-    jitterX = halton(frame % 8 + 1, 2) - .5f;
-    jitterY = halton(frame % 8 + 1, 3) - .5f;
+    jitterX = (halton(frame % 8 + 1, 2) - .5f) * jitterScale;
+    jitterY = (halton(frame % 8 + 1, 3) - .5f) * jitterScale;
 }
 static bool initialize(ID3D11DeviceContext *c) {
     if (device)
@@ -152,7 +173,7 @@ static bool initialize(ID3D11DeviceContext *c) {
         drop(error);
     }
     D3D11_BUFFER_DESC cb{};
-    cb.ByteWidth = 16;
+    cb.ByteWidth = 32;
     cb.Usage = D3D11_USAGE_DEFAULT;
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (ok)
@@ -246,7 +267,8 @@ static bool apply() {
     if (!historyValid)
         context->CopyResource(history, copy);
     gpuTimer.split(context);
-    float values[4] = {historyWeight, historyValid ? 1.f : 0.f, jitterX, jitterY};
+    float values[8] = {
+        historyWeight, historyValid ? 1.f : 0.f, jitterX, jitterY, blurStrength, 0, 0, 0};
     context->UpdateSubresource(params, 0, nullptr, values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
     ID3D11ShaderResourceView *inputs[] = {view, historyView};
@@ -268,6 +290,7 @@ static bool apply() {
     return true;
 }
 static void before(ID3D11DeviceContext *c) {
+    preparedDraw.valid = false;
     if (!enabled || internal || finished)
         return;
     ID3D11Buffer *b = nullptr;
@@ -320,6 +343,9 @@ static void before(ID3D11DeviceContext *c) {
     c->RSGetViewports(&n, &vp);
     if (!n || vp.Width < 320 || vp.Height < 180 || vp.TopLeftX || vp.TopLeftY)
         return;
+    preparedDraw.valid = true;
+    memcpy(preparedDraw.projection, projection, 64);
+    preparedDraw.viewport = vp;
     if (!target) {
         ID3D11Buffer *viewBuffer = nullptr;
         c->VSGetConstantBuffers(1, 1, &viewBuffer);
@@ -351,35 +377,44 @@ static ID3D11Buffer *jitter(ID3D11DeviceContext *c) {
     ID3D11Buffer *b = nullptr;
     c->VSGetConstantBuffers(0, 1, &b);
     float p[16]{};
-    if (!readBuffer(b, p, 64) || fabsf(p[15]) > .5f) {
-        drop(b);
-        return nullptr;
-    }
-    ID3D11Buffer *buffers[6]{};
-    c->VSGetConstantBuffers(0, 6, buffers);
-    const UINT sizes[] = {64, 64, 64, 16, 320, 48};
-    bool native = true;
-    for (int i = 0; i < 6; i++) {
-        D3D11_BUFFER_DESC d{};
-        if (buffers[i])
-            buffers[i]->GetDesc(&d);
-        native &= d.ByteWidth == sizes[i];
-        drop(buffers[i]);
-    }
-    UINT count = 1;
     D3D11_VIEWPORT vp{};
-    c->RSGetViewports(&count, &vp);
-    if (!native || !count || vp.Width < 320 || vp.Height < 180 || vp.TopLeftX || vp.TopLeftY ||
-        !initialize(c)) {
-        drop(b);
-        return nullptr;
+    if (preparedDraw.valid) {
+        memcpy(p, preparedDraw.projection, 64);
+        vp = preparedDraw.viewport;
+        if (!initialize(c)) {
+            drop(b);
+            return nullptr;
+        }
+    } else {
+        if (!readBuffer(b, p, 64) || fabsf(p[15]) > .5f) {
+            drop(b);
+            return nullptr;
+        }
+        ID3D11Buffer *buffers[6]{};
+        c->VSGetConstantBuffers(0, 6, buffers);
+        const UINT sizes[] = {64, 64, 64, 16, 320, 48};
+        bool native = true;
+        for (int i = 0; i < 6; i++) {
+            D3D11_BUFFER_DESC d{};
+            if (buffers[i])
+                buffers[i]->GetDesc(&d);
+            native &= d.ByteWidth == sizes[i];
+            drop(buffers[i]);
+        }
+        UINT count = 1;
+        c->RSGetViewports(&count, &vp);
+        if (!native || !count || vp.Width < 320 || vp.Height < 180 || vp.TopLeftX || vp.TopLeftY ||
+            !initialize(c)) {
+            drop(b);
+            return nullptr;
+        }
     }
     for (int i = 0; i < 4; i++) {
         p[i] += 2 * jitterX / vp.Width * p[12 + i];
         p[4 + i] -= 2 * jitterY / vp.Height * p[12 + i];
     }
     internal = true;
-    oldUpdate(c, jitterBuffer, 0, nullptr, p, 0, 0);
+    uploadProjection(c, p);
     c->VSSetConstantBuffers(0, 1, &jitterBuffer);
     internal = false;
     return b;
@@ -446,6 +481,14 @@ static void attach() {
                                                           L".\\Mods\\TemporalAA.ini"),
                                0, 85) *
                     .01f;
+    blurStrength = std::clamp((int)GetPrivateProfileIntW(L"TAA", L"BlurPercent", 12,
+                                                         L".\\Mods\\TemporalAA.ini"),
+                              0, 40) *
+                   .01f;
+    jitterScale = std::clamp((int)GetPrivateProfileIntW(L"TAA", L"JitterPercent", 75,
+                                                        L".\\Mods\\TemporalAA.ini"),
+                             25, 100) *
+                  .01f;
     if (!enabled)
         return;
     ID3D11Device *d = nullptr;
