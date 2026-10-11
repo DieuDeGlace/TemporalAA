@@ -4,12 +4,14 @@
 #include "NativeScene.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include "GpuPassTimer.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
 // Original world-only grading, made with AI assistance. No ReShade integration.
 namespace taa {
+static GpuPassTimer gpuTimer;
 template <class T> void drop(T *&p) {
     if (p) {
         p->Release();
@@ -225,6 +227,8 @@ static bool apply() {
     }
     internal = true;
     ID3DDeviceContextState *saved = nullptr;
+    gpuTimer.begin(device, context, "Mods\\TemporalAA.log",
+                   "TAA (input copy/resolve + history copy)");
     context1->SwapDeviceContextState(state, &saved);
     if (td.SampleDesc.Count > 1)
         context->ResolveSubresource(copy, 0, source, 0, rt.Format);
@@ -241,6 +245,7 @@ static bool apply() {
     context->PSSetShader(ps, nullptr, 0);
     if (!historyValid)
         context->CopyResource(history, copy);
+    gpuTimer.split(context);
     float values[4] = {historyWeight, historyValid ? 1.f : 0.f, jitterX, jitterY};
     context->UpdateSubresource(params, 0, nullptr, values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
@@ -254,6 +259,7 @@ static bool apply() {
     context->CopyResource(history, source);
     historyValid = true;
     context1->SwapDeviceContextState(saved, nullptr);
+    gpuTimer.end(context);
     drop(saved);
     drop(source);
     drop(target);
