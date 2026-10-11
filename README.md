@@ -23,3 +23,5 @@ ctest --test-dir build --output-on-failure
 ## Install
 
 Close Steam Cube World; copy build/TemporalAA.dll and optional config/TemporalAA.ini into Mods, then restart. Remove this DLL to uninstall. Existing MoonandShadow, alpha-lookalike and motion mods remain separate. WARP tests cover history accumulation, changed-pixel rejection, target resizing, state restoration and binding release at 720p,1080p and512×512. Tests do not establish Omega parity or frame rate.
+
+Fine-detail stabilization: opposing-neighbor peak/trough detection retains more bounded history on thin, alternating pixel detail (such as distant voxel steps). Broad edges and flat areas retain the original history settings. This is a screen-space feature-size adjustment, not a depth-based distance mask; nearby subpixel grass can also benefit. Stale history is still neighborhood-clamped and strongly changed pixels are rejected. Live confirmation is needed to establish whether this resolves the reported distant shimmer without undesirable trails.

@@ -39,15 +39,19 @@ Texture2D<float4> scene:register(t0);Texture2D<float4> history:register(t1);Samp
 float4 vs(uint id:SV_VertexID):SV_POSITION{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}
 float4 ps(float4 p:SV_POSITION):SV_TARGET{
  uint w,h;scene.GetDimensions(w,h);float2 uv=(p.xy+float2(jitterX,jitterY))/float2(w,h);
- float4 current=scene.SampleLevel(linearSampler,uv,0);float3 lo=current.rgb,hi=current.rgb;
+ float4 current=scene.SampleLevel(linearSampler,uv,0);float3 lo=current.rgb,hi=current.rgb;float3 left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb;
  [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++){
-  float3 c=scene.SampleLevel(linearSampler,uv+float2(x,y)/float2(w,h),0).rgb;lo=min(lo,c);hi=max(hi,c);
+  float3 c=scene.SampleLevel(linearSampler,uv+float2(x,y)/float2(w,h),0).rgb;lo=min(lo,c);hi=max(hi,c);if(y==0&&x==-1)left=c;if(y==0&&x==1)right=c;if(x==0&&y==-1)up=c;if(x==0&&y==1)down=c;
  }
  float3 old=history.Load(int3(p.xy,0)).rgb;
  float disagreement=max(abs(old.r-current.r),max(abs(old.g-current.g),abs(old.b-current.b)));
- float confidence=1-smoothstep(.035,.16,disagreement);
+ // Opposing neighbors distinguish a thin peak/trough from a broad silhouette.
+ float3 lr=(left-current.rgb)*(right-current.rgb),ud=(up-current.rgb)*(down-current.rgb);
+ float thin=saturate(24*sqrt(max(0,max(max(lr.r,lr.g),max(lr.b,max(max(ud.r,ud.g),ud.b))))));
+ float confidence=1-smoothstep(.035,lerp(.16,.30,thin),disagreement);
+ float accumulation=lerp(weight,max(weight,.78),thin);
  // History is bounded to this frame's neighborhood and rejected on changes.
- old=clamp(old,lo,hi);return float4(lerp(current.rgb,old,weight*valid*confidence),current.a);
+ old=clamp(old,lo,hi);return float4(lerp(current.rgb,old,accumulation*valid*confidence),current.a);
 })";
 static float halton(UINT i,UINT base){float f=1,r=0;while(i){f/=base;r+=f*(i%base);i/=base;}return r;}
 static void reset(){if(!finished)historyValid=false;drop(target);finished=false;frame++;jitterX=halton(frame%8+1,2)-.5f;jitterY=halton(frame%8+1,3)-.5f;}
