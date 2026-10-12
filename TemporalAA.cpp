@@ -5,6 +5,7 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include "GpuPassTimer.h"
+#include "CameraReprojection.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +13,11 @@
 // Original world-only grading, made with AI assistance. No ReShade integration.
 namespace taa {
 static GpuPassTimer gpuTimer;
+static reprojection::CameraHistory cameraHistory;
+static ID3D11DepthStencilView *sceneDepth = nullptr;
+static float sceneView[16]{}, sceneProjection[16]{};
+static bool sceneCameraValid = false;
+static bool cameraReprojection = true;
 template <class T> void drop(T *&p) {
     if (p) {
         p->Release();
@@ -105,8 +111,9 @@ static bool cameraKnown = false;
 static UINT width = 0, height = 0;
 static DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 static const char *code = R"(
-cbuffer Resolve:register(b0){float weight,valid,jitterX,jitterY;float blurStrength;float3 padding;};
-Texture2D<float4> scene:register(t0);Texture2D<float4> history:register(t1);SamplerState linearSampler:register(s0);
+cbuffer Resolve:register(b0){float weight,valid,jitterX,jitterY;float blurStrength,reprojectionEnabled,depthThreshold,padding;row_major float4x4 inverseCurrent,previousClip;float4 previousJitter;};
+Texture2D<float4> scene:register(t0);Texture2D<float4> history:register(t1);
+Texture2D<float> currentDepth:register(t2);Texture2D<float> previousDepth:register(t3);SamplerState linearSampler:register(s0);
 float4 vs(uint id:SV_VertexID):SV_POSITION{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}
 float4 ps(float4 p:SV_POSITION):SV_TARGET{
  uint w,h;scene.GetDimensions(w,h);float2 uv=(p.xy+float2(jitterX,jitterY))/float2(w,h);
@@ -114,7 +121,24 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
  [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++){
   float3 c=scene.SampleLevel(linearSampler,uv+float2(x,y)/float2(w,h),0).rgb;lo=min(lo,c);hi=max(hi,c);if(y==0&&x==-1)left=c;if(y==0&&x==1)right=c;if(x==0&&y==-1)up=c;if(x==0&&y==1)down=c;
  }
- float3 old=history.Load(int3(p.xy,0)).rgb;
+ float2 historyUV=p.xy/float2(w,h);float accepted=valid;
+ [branch]if(reprojectionEnabled>.5){
+  int2 pixel=clamp(int2(uv*float2(w,h)),int2(0,0),int2(w,h)-1);
+  float depth=currentDepth.Load(int3(pixel,0));
+  float2 depthUV=(float2(pixel)+.5)/float2(w,h);
+  float4 position=mul(inverseCurrent,float4(depthUV*float2(2,-2)+float2(-1,1),depth,1));
+  float4 previous=mul(previousClip,position);
+  float3 ndc=previous.xyz/max(previous.w,1e-8);
+  float2 oldDepthUV=ndc.xy*float2(.5,-.5)+.5;
+  historyUV=oldDepthUV-previousJitter.xy/float2(w,h);
+  // Reject uncovered pixels and changes in the previous depth surface.
+  bool covered=previous.w>0&&depth<.999999&&all(historyUV>=0)&&all(historyUV<1)&&all(oldDepthUV>=0)&&all(oldDepthUV<1)&&ndc.z>=0&&ndc.z<=1;
+  int2 oldPixel=clamp(int2(oldDepthUV*float2(w,h)),int2(0,0),int2(w,h)-1);
+  float oldDepth=previousDepth.Load(int3(oldPixel,0));
+  float tolerance=max(depthThreshold,2*(abs(ddx(ndc.z))+abs(ddy(ndc.z))));
+  accepted*=covered&&abs(oldDepth-ndc.z)<=tolerance?1:0;
+ }
+ float3 old=reprojectionEnabled>.5?history.SampleLevel(linearSampler,historyUV,0).rgb:history.Load(int3(p.xy,0)).rgb;
  float disagreement=max(abs(old.r-current.r),max(abs(old.g-current.g),abs(old.b-current.b)));
  // Opposing neighbors distinguish a thin peak/trough from a broad silhouette.
  float3 lr=(left-current.rgb)*(right-current.rgb),ud=(up-current.rgb)*(down-current.rgb);
@@ -123,7 +147,7 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
  float accumulation=lerp(weight,max(weight,.78),thin);
  // History is bounded to this frame's neighborhood and rejected on changes.
  float3 filtered=lerp(current.rgb,(current.rgb*4+left+right+up+down)/8,blurStrength);
- old=clamp(old,lo,hi);return float4(lerp(filtered,old,accumulation*valid*confidence),current.a);
+ old=clamp(old,lo,hi);return float4(lerp(filtered,old,accumulation*accepted*confidence),current.a);
 })";
 static float halton(UINT i, UINT base) {
     float f = 1, r = 0;
@@ -138,6 +162,8 @@ static void reset() {
     if (!finished)
         historyValid = false;
     drop(target);
+    drop(sceneDepth);
+    sceneCameraValid = false;
     finished = false;
     frame++;
     jitterX = (halton(frame % 8 + 1, 2) - .5f) * jitterScale;
@@ -173,7 +199,7 @@ static bool initialize(ID3D11DeviceContext *c) {
         drop(error);
     }
     D3D11_BUFFER_DESC cb{};
-    cb.ByteWidth = 32;
+    cb.ByteWidth = sizeof(reprojection::Parameters);
     cb.Usage = D3D11_USAGE_DEFAULT;
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (ok)
@@ -267,18 +293,49 @@ static bool apply() {
     if (!historyValid)
         context->CopyResource(history, copy);
     gpuTimer.split(context);
-    float values[8] = {
-        historyWeight, historyValid ? 1.f : 0.f, jitterX, jitterY, blurStrength, 0, 0, 0};
-    context->UpdateSubresource(params, 0, nullptr, values, 0, 0);
+    reprojection::Parameters values{};
+    values.resolve[0] = historyWeight;
+    values.resolve[1] = historyValid ? 1.f : 0.f;
+    values.resolve[2] = jitterX;
+    values.resolve[3] = jitterY;
+    values.options[0] = blurStrength;
+    values.options[2] = .00005f;
+    bool reproject = false;
+    if (!historyValid)
+        cameraHistory.invalidate();
+    if (cameraReprojection && sceneCameraValid) {
+        float jittered[16], currentMatrix[16];
+        memcpy(jittered, sceneProjection, 64);
+        for (int i = 0; i < 4; ++i) {
+            jittered[i] += 2 * jitterX / viewport.Width * jittered[12 + i];
+            jittered[4 + i] -= 2 * jitterY / viewport.Height * jittered[12 + i];
+        }
+        reprojection::multiply(jittered, sceneView, currentMatrix);
+        reproject = cameraHistory.prepare(device, context, sceneDepth, width, height, currentMatrix,
+                                          values);
+    }
+    if (!reproject)
+        cameraHistory.invalidate();
+    static int reportedMode = -1;
+    if (reportedMode != (int)reproject) {
+        reportedMode = (int)reproject;
+        log(reproject ? "Camera reprojection active: GPU depth copies and history depth rejection."
+                      : "Camera reprojection unavailable: color-history fallback active.");
+    }
+    context->UpdateSubresource(params, 0, nullptr, &values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
     ID3D11ShaderResourceView *inputs[] = {view, historyView};
     context->PSSetShaderResources(0, 2, inputs);
+    if (reproject)
+        cameraHistory.bind(context);
     context->PSSetSamplers(0, 1, &sampler);
     oldD(context, 3, 0);
-    ID3D11ShaderResourceView *empty[2] = {};
-    context->PSSetShaderResources(0, 2, empty);
+    ID3D11ShaderResourceView *empty[4] = {};
+    context->PSSetShaderResources(0, 4, empty);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     context->CopyResource(history, source);
+    if (reproject)
+        cameraHistory.commit(context);
     historyValid = true;
     context1->SwapDeviceContextState(saved, nullptr);
     gpuTimer.end(context);
@@ -362,13 +419,16 @@ static void before(ID3D11DeviceContext *c) {
                 if (cut)
                     historyValid = false;
             }
+            memcpy(sceneView, camera, 64);
+            memcpy(sceneProjection, projection, 64);
+            sceneCameraValid = true;
             memcpy(previousView, camera, 64);
             memcpy(previousProjection, projection, 64);
             cameraKnown = true;
         }
         context = c;
         viewport = vp;
-        c->OMGetRenderTargets(1, &target, nullptr);
+        c->OMGetRenderTargets(1, &target, &sceneDepth);
     }
 }
 static ID3D11Buffer *jitter(ID3D11DeviceContext *c) {
@@ -477,6 +537,8 @@ static void attach() {
     if (table || !nativeScene::supported())
         return;
     enabled = GetPrivateProfileIntW(L"TAA", L"Enabled", 1, L".\\Mods\\TemporalAA.ini") != 0;
+    cameraReprojection =
+        GetPrivateProfileIntW(L"TAA", L"CameraReprojection", 1, L".\\Mods\\TemporalAA.ini") != 0;
     historyWeight = std::clamp((int)GetPrivateProfileIntW(L"TAA", L"HistoryPercent", 65,
                                                           L".\\Mods\\TemporalAA.ini"),
                                0, 85) *
@@ -524,7 +586,7 @@ static void attach() {
     }
     if (ok) {
         table = v;
-        log("TemporalAA prototype enabled; F9 toggles. Jitter/history resolve, no motion-vector buffer.");
+        log("Experimental TemporalAA enabled; F9 toggles. Depth-derived camera motion and history depth rejection; no object motion vectors.");
     }
     drop(c);
     drop(d);

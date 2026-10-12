@@ -11,3 +11,7 @@ These measure GPU execution of the named passes, not total frame time, CPU captu
 Projection uploads are reused when all 64 bytes are identical. World-draw classification and projection/viewport inspection are shared between capture and jitter instead of repeated. The fallback path remains for draws outside normal capture.
 
 `BlurPercent=12` blends a mild cross-neighborhood filter from samples already fetched by the resolve. `JitterPercent=75` reduces the eight-frame jitter amplitude without changing its sequence. No extra texture samples or fullscreen passes are added. GPU tests cover upload reuse, changed projection readback, equivalent preparation paths, blur, uniform colors, history rejection, resizing, and state restoration. Actual FPS improvement still requires a game comparison.
+
+## Camera-reprojection test branch
+
+No additional draw calls: depth reconstruction and history reprojection run inside the existing resolve shader. Added costs are two depth-texture reads per pixel, matrix arithmetic, bilinear history sampling, and GPU depth copies. Two depth textures consume approximately 16 MiB at 1080p with 32-bit depth. Actual timings require a live RX 6600 comparison. The TAA timer includes these operations in its second segment. Dynamic objects do not have object motion vectors in this first experiment.

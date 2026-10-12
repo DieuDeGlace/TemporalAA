@@ -9,6 +9,14 @@ int main() {
     taa::oldD = (taa::D)(*(void ***)c)[13];
     assert(taa::initialize(c));
     taa::blurStrength = 0;
+    float invertible[16] = {2, 0, 0, 3, 0, 4, 0, -2, 0, 0, .5f, 7, 0, 0, 0, 1};
+    float inverted[16], identity[16];
+    assert(reprojection::inverse(invertible, inverted));
+    reprojection::multiply(invertible, inverted, identity);
+    for (int i = 0; i < 16; ++i)
+        assert(fabsf(identity[i] - (i % 5 == 0 ? 1.f : 0.f)) < .00001f);
+    float singular[16]{};
+    assert(!reprojection::inverse(singular, inverted));
     taa::oldUpdate = (taa::Update)(*(void ***)c)[48];
     float projection[16]{};
     projection[0] = projection[5] = projection[10] = projection[15] = 1;
@@ -87,7 +95,20 @@ int main() {
         td.Usage = D3D11_USAGE_STAGING;
         td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &staging)));
-        auto resolve = [&](int low, int high) {
+        ID3D11Texture2D *depthTexture = nullptr;
+        ID3D11DepthStencilView *depthView = nullptr;
+        D3D11_TEXTURE2D_DESC depthDesc{};
+        depthDesc.Width = size.first;
+        depthDesc.Height = size.second;
+        depthDesc.MipLevels = depthDesc.ArraySize = depthDesc.SampleDesc.Count = 1;
+        depthDesc.Format = size.first == 1280   ? DXGI_FORMAT_D24_UNORM_S8_UINT
+                           : size.first == 1920 ? DXGI_FORMAT_D32_FLOAT
+                                                : DXGI_FORMAT_D16_UNORM;
+        depthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        assert(SUCCEEDED(d->CreateTexture2D(&depthDesc, nullptr, &depthTexture)));
+        assert(SUCCEEDED(d->CreateDepthStencilView(depthTexture, nullptr, &depthView)));
+        c->ClearDepthStencilView(depthView, D3D11_CLEAR_DEPTH, .5f, 0);
+        auto resolve = [&](int low, int high, bool reproject = false) {
             std::vector<unsigned char> p(size.first * size.second * 4);
             for (UINT y = 0; y < size.second; y++)
                 for (UINT x = 0; x < size.first; x++) {
@@ -102,6 +123,12 @@ int main() {
             rt->AddRef();
             taa::viewport = {0, 0, (float)size.first, (float)size.second, 0, 1};
             taa::finished = false;
+            taa::sceneCameraValid = reproject;
+            taa::drop(taa::sceneDepth);
+            if (reproject) {
+                taa::sceneDepth = depthView;
+                depthView->AddRef();
+            }
             taa::jitterX = taa::jitterY = 0;
             assert(taa::apply());
             ID3D11RenderTargetView *restored = nullptr;
@@ -128,6 +155,25 @@ int main() {
         taa::historyValid = false;
         assert(resolve(140, 140) == 140);
         taa::blurStrength = 0;
+        // Actual depth-backed resolve: camera translation changes the history
+        // coordinate; a newly exposed depth must reject that old surface.
+        memset(taa::sceneView, 0, sizeof(taa::sceneView));
+        memset(taa::sceneProjection, 0, sizeof(taa::sceneProjection));
+        for (int i : {0, 5, 10, 15})
+            taa::sceneView[i] = taa::sceneProjection[i] = 1;
+        taa::historyValid = false;
+        assert(resolve(70, 90, true) == 70);
+        taa::sceneView[3] = 2.f / size.first;
+        int translated = resolve(70, 90, true);
+        assert(translated > 75 && translated < 90);
+        c->ClearDepthStencilView(depthView, D3D11_CLEAR_DEPTH, .1f, 0);
+        assert(resolve(70, 90, true) == 70);
+        taa::sceneCameraValid = false;
+        taa::drop(taa::sceneDepth);
+        taa::drop(depthView);
+        taa::drop(depthTexture);
+        printf("Depth-backed camera reprojection and disocclusion: %ux%u PASS\n", size.first,
+               size.second);
         ID3DDeviceContextState *saved = nullptr;
         taa::context1->SwapDeviceContextState(taa::state, &saved);
         ID3D11RenderTargetView *parked = nullptr;
