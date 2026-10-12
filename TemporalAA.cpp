@@ -1,3 +1,17 @@
+// TemporalAA: temporal anti-aliasing for Cube World (Steam, 64-bit, D3D11),
+// made with AI assistance. No ReShade integration.
+//
+// How it works:
+//   * Map/Unmap/UpdateSubresource hooks remember the contents of every 64-byte
+//     constant buffer (as private data on the buffer), so the projection matrix
+//     of a draw can be read back without a GPU readback.
+//   * Draw/DrawIndexed hooks: world draws get a sub-pixel jittered copy of the
+//     projection (8-frame Halton sequence) bound in place of the native one.
+//   * The first orthographic (HUD) draw into the scene target marks the end of
+//     the 3D world: the jittered frame is blended with the previous frames'
+//     history (apply()), after MoonandShadow and alpha-lookalike finish their
+//     own world passes.
+//   * F9 toggles the effect.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "cwsdk.h"
@@ -9,7 +23,6 @@
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
-// Original world-only grading, made with AI assistance. No ReShade integration.
 namespace taa {
 static GpuPassTimer gpuTimer;
 template <class T> void drop(T *&p) {
@@ -18,6 +31,15 @@ template <class T> void drop(T *&p) {
         p = nullptr;
     }
 }
+
+// ===========================================================================
+// Hooked ID3D11DeviceContext methods and constant-buffer shadow copies
+// ===========================================================================
+
+// ID3D11DeviceContext vtable slots.
+constexpr UINT SLOT_DRAW_INDEXED = 12, SLOT_DRAW = 13, SLOT_MAP = 14, SLOT_UNMAP = 15,
+               SLOT_UPDATE_SUBRESOURCE = 48;
+
 using DI = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, INT);
 using D = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT);
 using Map = HRESULT(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, D3D11_MAP,
@@ -28,14 +50,18 @@ using Update = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *
 static Map oldMap;
 static Unmap oldUnmap;
 static Update oldUpdate;
-static void **table = nullptr;
+static void **table = nullptr; // Hooked context vtable (set once attached).
+
+// Private-data key under which the last written contents of each 64-byte
+// constant buffer are stored.
 static const GUID cacheGuid = {
     0x7435cd29, 0x9d35, 0x4ef2, {0xa1, 0x25, 0x54, 0x18, 0x81, 0x27, 0x22, 0x93}};
 struct Mapped {
     void *data;
     UINT size;
 };
-static thread_local std::unordered_map<ID3D11Resource *, Mapped> mapped;
+static thread_local std::unordered_map<ID3D11Resource *, Mapped> mapped; // Currently mapped.
+
 static void log(const char *s) {
     FILE *f = nullptr;
     fopen_s(&f, "Mods\\TemporalAA.log", "a");
@@ -44,6 +70,7 @@ static void log(const char *s) {
         fclose(f);
     }
 }
+// 64 if `r` is a 64-byte constant buffer (a single matrix), otherwise 0.
 static UINT bytes(ID3D11Resource *r) {
     ID3D11Buffer *b = nullptr;
     if (FAILED(r->QueryInterface(__uuidof(ID3D11Buffer), (void **)&b)))
@@ -53,13 +80,22 @@ static UINT bytes(ID3D11Resource *r) {
     b->Release();
     return (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && d.ByteWidth == 64 ? 64 : 0;
 }
+// Reads the shadow copy of a constant buffer's contents.
 static bool readBuffer(ID3D11Buffer *b, void *out, UINT n) {
     UINT got = n;
     return b && SUCCEEDED(b->GetPrivateData(cacheGuid, &got, out)) && got == n;
 }
+
+// ===========================================================================
+// State
+// ===========================================================================
+
 static bool enabled = true, internal = false, finished = false;
+// Settings (see TemporalAA.ini).
 static float historyWeight = .65f;
 static float blurStrength = .12f, jitterScale = .75f;
+
+// What before() learned about the current draw, reused by jitter().
 struct PreparedDraw {
     bool valid = false;
     float projection[16]{};
@@ -68,14 +104,15 @@ struct PreparedDraw {
 static PreparedDraw preparedDraw;
 static UINT frame = 0;
 static bool historyValid = false;
-static float jitterX = 0, jitterY = 0;
+static float jitterX = 0, jitterY = 0; // Current jitter in pixels.
 static ID3D11Texture2D *history = nullptr;
 static ID3D11ShaderResourceView *historyView = nullptr;
 static ID3D11SamplerState *sampler = nullptr;
-static ID3D11Buffer *jitterBuffer = nullptr;
+static ID3D11Buffer *jitterBuffer = nullptr; // Our jittered projection constant buffer.
 static float uploadedProjection[16]{};
 static bool projectionUploaded = false;
 static unsigned projectionUploads = 0;
+
 // The private jitter buffer is written only here. Reuse identical contents
 // across draws; binding and restoring the native buffer remains per draw.
 static void uploadProjection(ID3D11DeviceContext *c, const float *projection) {
@@ -86,13 +123,14 @@ static void uploadProjection(ID3D11DeviceContext *c, const float *projection) {
     projectionUploaded = true;
     ++projectionUploads;
 }
+
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *context = nullptr;
 static ID3D11DeviceContext1 *context1 = nullptr;
-static ID3DDeviceContextState *state = nullptr;
-static ID3D11Texture2D *copy = nullptr;
+static ID3DDeviceContextState *state = nullptr; // Isolated pipeline state for our pass.
+static ID3D11Texture2D *copy = nullptr;         // This frame's scene, as shader input.
 static ID3D11ShaderResourceView *view = nullptr;
-static ID3D11RenderTargetView *target = nullptr;
+static ID3D11RenderTargetView *target = nullptr; // The scene target of this frame.
 static D3D11_VIEWPORT viewport{};
 static ID3D11VertexShader *vs = nullptr;
 static ID3D11PixelShader *ps = nullptr;
@@ -100,31 +138,60 @@ static ID3D11Buffer *params = nullptr;
 static ID3D11RasterizerState *raster = nullptr;
 static DI oldDI = nullptr;
 static D oldD = nullptr;
+// Camera of the previous frame: a cut or zoom invalidates history.
 static float previousView[16]{}, previousProjection[16]{};
 static bool cameraKnown = false;
 static UINT width = 0, height = 0;
 static DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+
+// ===========================================================================
+// Resolve shader
+// ===========================================================================
+
+// vs: full-screen triangle from SV_VertexID. ps: blends this frame with the
+// clamped history, keeping more history on thin details.
 static const char *code = R"(
 cbuffer Resolve:register(b0){float weight,valid,jitterX,jitterY;float blurStrength;float3 padding;};
-Texture2D<float4> scene:register(t0);Texture2D<float4> history:register(t1);SamplerState linearSampler:register(s0);
-float4 vs(uint id:SV_VertexID):SV_POSITION{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}
+Texture2D<float4> scene:register(t0);
+Texture2D<float4> history:register(t1);
+SamplerState linearSampler:register(s0);
+
+float4 vs(uint id:SV_VertexID):SV_POSITION{
+    float2 p=float2((id<<1)&2,id&2);
+    return float4(p*float2(2,-2)+float2(-1,1),0,1);
+}
+
 float4 ps(float4 p:SV_POSITION):SV_TARGET{
- uint w,h;scene.GetDimensions(w,h);float2 uv=(p.xy+float2(jitterX,jitterY))/float2(w,h);
- float4 current=scene.SampleLevel(linearSampler,uv,0);float3 lo=current.rgb,hi=current.rgb;float3 left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb;
- [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++){
-  float3 c=scene.SampleLevel(linearSampler,uv+float2(x,y)/float2(w,h),0).rgb;lo=min(lo,c);hi=max(hi,c);if(y==0&&x==-1)left=c;if(y==0&&x==1)right=c;if(x==0&&y==-1)up=c;if(x==0&&y==1)down=c;
- }
- float3 old=history.Load(int3(p.xy,0)).rgb;
- float disagreement=max(abs(old.r-current.r),max(abs(old.g-current.g),abs(old.b-current.b)));
- // Opposing neighbors distinguish a thin peak/trough from a broad silhouette.
- float3 lr=(left-current.rgb)*(right-current.rgb),ud=(up-current.rgb)*(down-current.rgb);
- float thin=saturate(24*sqrt(max(0,max(max(lr.r,lr.g),max(lr.b,max(max(ud.r,ud.g),ud.b))))));
- float confidence=1-smoothstep(.035,lerp(.16,.30,thin),disagreement);
- float accumulation=lerp(weight,max(weight,.78),thin);
- // History is bounded to this frame's neighborhood and rejected on changes.
- float3 filtered=lerp(current.rgb,(current.rgb*4+left+right+up+down)/8,blurStrength);
- old=clamp(old,lo,hi);return float4(lerp(filtered,old,accumulation*valid*confidence),current.a);
+    uint w,h;
+    scene.GetDimensions(w,h);
+    float2 uv=(p.xy+float2(jitterX,jitterY))/float2(w,h);
+    float4 current=scene.SampleLevel(linearSampler,uv,0);
+    float3 lo=current.rgb,hi=current.rgb;
+    float3 left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb;
+    [unroll]for(int y=-1;y<=1;y++)
+        [unroll]for(int x=-1;x<=1;x++){
+            float3 c=scene.SampleLevel(linearSampler,uv+float2(x,y)/float2(w,h),0).rgb;
+            lo=min(lo,c);
+            hi=max(hi,c);
+            if(y==0&&x==-1)left=c;
+            if(y==0&&x==1)right=c;
+            if(x==0&&y==-1)up=c;
+            if(x==0&&y==1)down=c;
+        }
+    float3 old=history.Load(int3(p.xy,0)).rgb;
+    float disagreement=max(abs(old.r-current.r),max(abs(old.g-current.g),abs(old.b-current.b)));
+    // Opposing neighbors distinguish a thin peak/trough from a broad silhouette.
+    float3 lr=(left-current.rgb)*(right-current.rgb),ud=(up-current.rgb)*(down-current.rgb);
+    float thin=saturate(24*sqrt(max(0,max(max(lr.r,lr.g),max(lr.b,max(max(ud.r,ud.g),ud.b))))));
+    float confidence=1-smoothstep(.035,lerp(.16,.30,thin),disagreement);
+    float accumulation=lerp(weight,max(weight,.78),thin);
+    // History is bounded to this frame's neighborhood and rejected on changes.
+    float3 filtered=lerp(current.rgb,(current.rgb*4+left+right+up+down)/8,blurStrength);
+    old=clamp(old,lo,hi);
+    return float4(lerp(filtered,old,accumulation*valid*confidence),current.a);
 })";
+
+// Halton low-discrepancy sequence in [0, 1).
 static float halton(UINT i, UINT base) {
     float f = 1, r = 0;
     while (i) {
@@ -134,8 +201,10 @@ static float halton(UINT i, UINT base) {
     }
     return r;
 }
+
+// Called once per presented frame: advances the jitter.
 static void reset() {
-    if (!finished)
+    if (!finished) // The previous frame never resolved.
         historyValid = false;
     drop(target);
     finished = false;
@@ -143,6 +212,8 @@ static void reset() {
     jitterX = (halton(frame % 8 + 1, 2) - .5f) * jitterScale;
     jitterY = (halton(frame % 8 + 1, 3) - .5f) * jitterScale;
 }
+
+// Creates the size-independent resources on first use (for context `c`).
 static bool initialize(ID3D11DeviceContext *c) {
     if (device)
         return context == c && vs && ps && params && state && raster && sampler && jitterBuffer;
@@ -158,17 +229,18 @@ static bool initialize(ID3D11DeviceContext *c) {
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
     for (int i = 0; i < 2 && ok; i++) {
+        bool pixel = i == 1;
         ID3DBlob *b = nullptr, *error = nullptr;
         ok = SUCCEEDED(D3DCompile(code, strlen(code), "TemporalResolve", nullptr, nullptr,
-                                  i ? "ps" : "vs", i ? "ps_4_0" : "vs_4_0",
+                                  pixel ? "ps" : "vs", pixel ? "ps_4_0" : "vs_4_0",
                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, &error));
         if (error)
             log((char *)error->GetBufferPointer());
         if (ok)
-            ok = SUCCEEDED(i ? device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(),
-                                                         nullptr, &ps)
-                             : device->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(),
-                                                          nullptr, &vs));
+            ok = SUCCEEDED(pixel ? device->CreatePixelShader(b->GetBufferPointer(),
+                                                             b->GetBufferSize(), nullptr, &ps)
+                                 : device->CreateVertexShader(b->GetBufferPointer(),
+                                                              b->GetBufferSize(), nullptr, &vs));
         drop(b);
         drop(error);
     }
@@ -195,6 +267,8 @@ static bool initialize(ID3D11DeviceContext *c) {
         ok = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &jitterBuffer));
     return ok;
 }
+
+// (Re)creates the scene copy and history textures for the target's size/format.
 static bool texture(ID3D11Texture2D *source, DXGI_FORMAT typed) {
     D3D11_TEXTURE2D_DESC d{};
     source->GetDesc(&d);
@@ -221,6 +295,13 @@ static bool texture(ID3D11Texture2D *source, DXGI_FORMAT typed) {
            SUCCEEDED(device->CreateTexture2D(&d, nullptr, &history)) &&
            SUCCEEDED(device->CreateShaderResourceView(history, nullptr, &historyView));
 }
+
+// ===========================================================================
+// Resolve pass
+// ===========================================================================
+
+// Resolves the jittered scene in `target` against history (once per frame) in
+// an isolated device-context state, then stores the result as new history.
 static bool apply() {
     if (internal || finished || !target || !initialize(context))
         return false;
@@ -251,6 +332,7 @@ static bool apply() {
     gpuTimer.begin(device, context, "Mods\\TemporalAA.log",
                    "TAA (input copy/resolve + history copy)");
     context1->SwapDeviceContextState(state, &saved);
+    // Copy (or MSAA-resolve) the scene so it can be read while writing `target`.
     if (td.SampleDesc.Count > 1)
         context->ResolveSubresource(copy, 0, source, 0, rt.Format);
     else
@@ -274,7 +356,7 @@ static bool apply() {
     ID3D11ShaderResourceView *inputs[] = {view, historyView};
     context->PSSetShaderResources(0, 2, inputs);
     context->PSSetSamplers(0, 1, &sampler);
-    oldD(context, 3, 0);
+    oldD(context, 3, 0); // Full-screen triangle.
     ID3D11ShaderResourceView *empty[2] = {};
     context->PSSetShaderResources(0, 2, empty);
     context->OMSetRenderTargets(0, nullptr, nullptr);
@@ -289,6 +371,76 @@ static bool apply() {
     finished = true;
     return true;
 }
+
+// ===========================================================================
+// Draw classification
+// ===========================================================================
+
+// Native world draws bind six vertex constant buffers of these sizes.
+static bool hasNativeWorldBuffers(ID3D11DeviceContext *c) {
+    ID3D11Buffer *buffers[6]{};
+    c->VSGetConstantBuffers(0, 6, buffers);
+    const UINT sizes[] = {64, 64, 64, 16, 320, 48};
+    bool native = true;
+    for (int i = 0; i < 6; i++) {
+        D3D11_BUFFER_DESC d{};
+        if (buffers[i])
+            buffers[i]->GetDesc(&d);
+        native &= d.ByteWidth == sizes[i];
+        drop(buffers[i]);
+    }
+    return native;
+}
+// A full-screen scene viewport (not a preview or a small render target).
+static bool sceneViewport(UINT count, const D3D11_VIEWPORT &vp) {
+    return !(!count || vp.Width < 320 || vp.Height < 180 || vp.TopLeftX || vp.TopLeftY);
+}
+
+// Lets the other Steam mods finish their world passes before the resolve.
+static void finishOtherMods() {
+    auto module = GetModuleHandleW(L"MoonandShadow.dll");
+    auto finish =
+        module ? (void(WINAPI *)())GetProcAddress(module, "FinishWorldLighting") : nullptr;
+    if (finish)
+        finish();
+    auto gradeModule = GetModuleHandleW(L"alpha-lookalike.dll");
+    auto grade = gradeModule ? (void(WINAPI *)())GetProcAddress(gradeModule, "FinishAlphaLookalike")
+                             : nullptr;
+    if (grade)
+        grade();
+}
+
+// On the first world draw of a frame: remember the scene target and invalidate
+// history after a camera cut (big move/turn) or zoom change.
+static void beginFrame(ID3D11DeviceContext *c, const float *projection, const D3D11_VIEWPORT &vp) {
+    ID3D11Buffer *viewBuffer = nullptr;
+    c->VSGetConstantBuffers(1, 1, &viewBuffer);
+    float camera[16]{};
+    bool known = readBuffer(viewBuffer, camera, 64);
+    drop(viewBuffer);
+    if (known) {
+        if (cameraKnown) {
+            bool cut = false;
+            // Translation (column 3) may move 8 units, rotation entries 0.35.
+            for (int i = 0; i < 12; i++)
+                cut |= fabsf(camera[i] - previousView[i]) > ((i % 4 == 3) ? 8.f : .35f);
+            cut |= fabsf(projection[0] - previousProjection[0]) > .01f ||
+                   fabsf(projection[5] - previousProjection[5]) > .01f;
+            if (cut)
+                historyValid = false;
+        }
+        memcpy(previousView, camera, 64);
+        memcpy(previousProjection, projection, 64);
+        cameraKnown = true;
+    }
+    context = c;
+    viewport = vp;
+    c->OMGetRenderTargets(1, &target, nullptr);
+}
+
+// Runs before every draw. A perspective draw with the native world layout is
+// "prepared" for jittering; an orthographic draw into the scene target means
+// the world is complete, so the resolve runs.
 static void before(ID3D11DeviceContext *c) {
     preparedDraw.valid = false;
     if (!enabled || internal || finished)
@@ -300,77 +452,36 @@ static void before(ID3D11DeviceContext *c) {
     drop(b);
     if (!known)
         return;
-    if (fabsf(projection[15]) > .5f) {
+    bool orthographic = fabsf(projection[15]) > .5f;
+    if (orthographic) {
         if (target) {
             ID3D11RenderTargetView *current = nullptr;
             c->OMGetRenderTargets(1, &current, nullptr);
             bool same = current == target;
             drop(current);
             if (same) {
-                auto module = GetModuleHandleW(L"MoonandShadow.dll");
-                auto finish = module
-                                  ? (void(WINAPI *)())GetProcAddress(module, "FinishWorldLighting")
-                                  : nullptr;
-                if (finish)
-                    finish();
-                auto gradeModule = GetModuleHandleW(L"alpha-lookalike.dll");
-                auto grade = gradeModule ? (void(WINAPI *)())GetProcAddress(gradeModule,
-                                                                            "FinishAlphaLookalike")
-                                         : nullptr;
-                if (grade)
-                    grade();
+                finishOtherMods();
                 apply();
             }
         }
         return;
     }
-    ID3D11Buffer *worldBuffers[6]{};
-    c->VSGetConstantBuffers(0, 6, worldBuffers);
-    bool native = true;
-    const UINT sizes[] = {64, 64, 64, 16, 320, 48};
-    for (int i = 0; i < 6; i++) {
-        D3D11_BUFFER_DESC d{};
-        if (worldBuffers[i])
-            worldBuffers[i]->GetDesc(&d);
-        if (d.ByteWidth != sizes[i])
-            native = false;
-        drop(worldBuffers[i]);
-    }
-    if (!native)
+    if (!hasNativeWorldBuffers(c))
         return;
     UINT n = 1;
     D3D11_VIEWPORT vp{};
     c->RSGetViewports(&n, &vp);
-    if (!n || vp.Width < 320 || vp.Height < 180 || vp.TopLeftX || vp.TopLeftY)
+    if (!sceneViewport(n, vp))
         return;
     preparedDraw.valid = true;
     memcpy(preparedDraw.projection, projection, 64);
     preparedDraw.viewport = vp;
-    if (!target) {
-        ID3D11Buffer *viewBuffer = nullptr;
-        c->VSGetConstantBuffers(1, 1, &viewBuffer);
-        float camera[16]{};
-        bool known = readBuffer(viewBuffer, camera, 64);
-        drop(viewBuffer);
-        if (known) {
-            if (cameraKnown) {
-                bool cut = false;
-                for (int i = 0; i < 12; i++)
-                    cut |= fabsf(camera[i] - previousView[i]) > ((i % 4 == 3) ? 8.f : .35f);
-                cut |= fabsf(projection[0] - previousProjection[0]) > .01f ||
-                       fabsf(projection[5] - previousProjection[5]) > .01f;
-                if (cut)
-                    historyValid = false;
-            }
-            memcpy(previousView, camera, 64);
-            memcpy(previousProjection, projection, 64);
-            cameraKnown = true;
-        }
-        context = c;
-        viewport = vp;
-        c->OMGetRenderTargets(1, &target, nullptr);
-    }
+    if (!target)
+        beginFrame(c, projection, vp);
 }
+
+// Binds a jittered copy of the projection for a world draw. Returns the native
+// buffer (to rebind after the draw) or nullptr if nothing was changed.
 static ID3D11Buffer *jitter(ID3D11DeviceContext *c) {
     if (internal || !enabled)
         return nullptr;
@@ -390,25 +501,15 @@ static ID3D11Buffer *jitter(ID3D11DeviceContext *c) {
             drop(b);
             return nullptr;
         }
-        ID3D11Buffer *buffers[6]{};
-        c->VSGetConstantBuffers(0, 6, buffers);
-        const UINT sizes[] = {64, 64, 64, 16, 320, 48};
-        bool native = true;
-        for (int i = 0; i < 6; i++) {
-            D3D11_BUFFER_DESC d{};
-            if (buffers[i])
-                buffers[i]->GetDesc(&d);
-            native &= d.ByteWidth == sizes[i];
-            drop(buffers[i]);
-        }
+        bool native = hasNativeWorldBuffers(c);
         UINT count = 1;
         c->RSGetViewports(&count, &vp);
-        if (!native || !count || vp.Width < 320 || vp.Height < 180 || vp.TopLeftX || vp.TopLeftY ||
-            !initialize(c)) {
+        if (!native || !sceneViewport(count, vp) || !initialize(c)) {
             drop(b);
             return nullptr;
         }
     }
+    // Shift clip-space x/y by the jitter (scaled by w).
     for (int i = 0; i < 4; i++) {
         p[i] += 2 * jitterX / vp.Width * p[12 + i];
         p[4 + i] -= 2 * jitterY / vp.Height * p[12 + i];
@@ -419,6 +520,11 @@ static ID3D11Buffer *jitter(ID3D11DeviceContext *c) {
     internal = false;
     return b;
 }
+
+// ===========================================================================
+// Hooks
+// ===========================================================================
+
 static void STDMETHODCALLTYPE di(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     before(c);
     auto original = jitter(c);
@@ -437,6 +543,7 @@ static void STDMETHODCALLTYPE draw(ID3D11DeviceContext *c, UINT n, UINT s) {
         drop(original);
     }
 }
+// Map/Unmap: remember writes to 64-byte constant buffers.
 static HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub,
                                      D3D11_MAP t, UINT flags, D3D11_MAPPED_SUBRESOURCE *m) {
     auto hr = oldMap(c, r, sub, t, flags, m);
@@ -464,6 +571,7 @@ static void STDMETHODCALLTYPE update(ID3D11DeviceContext *c, ID3D11Resource *r, 
     }
     oldUpdate(c, r, sub, box, data, row, slice);
 }
+
 static bool patch(void **slot, void *fn) {
     DWORD old;
     if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
@@ -473,22 +581,24 @@ static bool patch(void **slot, void *fn) {
     VirtualProtect(slot, sizeof(void *), old, &unused);
     return true;
 }
+
+static void loadSettings() {
+    const wchar_t *ini = L".\\Mods\\TemporalAA.ini";
+    enabled = GetPrivateProfileIntW(L"TAA", L"Enabled", 1, ini) != 0;
+    historyWeight =
+        std::clamp((int)GetPrivateProfileIntW(L"TAA", L"HistoryPercent", 65, ini), 0, 85) * .01f;
+    blurStrength =
+        std::clamp((int)GetPrivateProfileIntW(L"TAA", L"BlurPercent", 12, ini), 0, 40) * .01f;
+    jitterScale =
+        std::clamp((int)GetPrivateProfileIntW(L"TAA", L"JitterPercent", 75, ini), 25, 100) * .01f;
+}
+
+// Hooks the shared ID3D11DeviceContext vtable (taken from a temporary device).
+// All hooks are installed or none are.
 static void attach() {
     if (table || !nativeScene::supported())
         return;
-    enabled = GetPrivateProfileIntW(L"TAA", L"Enabled", 1, L".\\Mods\\TemporalAA.ini") != 0;
-    historyWeight = std::clamp((int)GetPrivateProfileIntW(L"TAA", L"HistoryPercent", 65,
-                                                          L".\\Mods\\TemporalAA.ini"),
-                               0, 85) *
-                    .01f;
-    blurStrength = std::clamp((int)GetPrivateProfileIntW(L"TAA", L"BlurPercent", 12,
-                                                         L".\\Mods\\TemporalAA.ini"),
-                              0, 40) *
-                   .01f;
-    jitterScale = std::clamp((int)GetPrivateProfileIntW(L"TAA", L"JitterPercent", 75,
-                                                        L".\\Mods\\TemporalAA.ini"),
-                             25, 100) *
-                  .01f;
+    loadSettings();
     if (!enabled)
         return;
     ID3D11Device *d = nullptr;
@@ -502,11 +612,11 @@ static void attach() {
         void *fn;
         void **original;
     };
-    Hook hooks[] = {{12, (void *)di, (void **)&oldDI},
-                    {13, (void *)draw, (void **)&oldD},
-                    {14, (void *)map, (void **)&oldMap},
-                    {15, (void *)unmap, (void **)&oldUnmap},
-                    {48, (void *)update, (void **)&oldUpdate}};
+    Hook hooks[] = {{SLOT_DRAW_INDEXED, (void *)di, (void **)&oldDI},
+                    {SLOT_DRAW, (void *)draw, (void **)&oldD},
+                    {SLOT_MAP, (void *)map, (void **)&oldMap},
+                    {SLOT_UNMAP, (void *)unmap, (void **)&oldUnmap},
+                    {SLOT_UPDATE_SUBRESOURCE, (void *)update, (void **)&oldUpdate}};
     for (auto &h : hooks)
         *h.original = v[h.slot];
     int done = 0;
@@ -530,6 +640,11 @@ static void attach() {
     drop(d);
 }
 } // namespace taa
+
+// ===========================================================================
+// Cube World mod-loader entry points
+// ===========================================================================
+
 class TemporalAA : public GenericMod {
   public:
     void Initialize() override {
