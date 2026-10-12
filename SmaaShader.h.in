@@ -1,0 +1,8 @@
+#pragma once
+inline constexpr char smaaLibrary[] = R"SMAALIB(
+cbuffer SMAAMetrics:register(b1){float4 smaaMetrics;};
+#define SMAA_RT_METRICS smaaMetrics
+#define SMAA_HLSL_4
+#define SMAA_PRESET_MEDIUM
+@SMAA_SOURCE@
+)SMAALIB";

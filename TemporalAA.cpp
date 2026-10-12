@@ -6,6 +6,7 @@
 #include <d3dcompiler.h>
 #include "GpuPassTimer.h"
 #include "CameraReprojection.h"
+#include "SmaaPipeline.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +19,8 @@ static ID3D11DepthStencilView *sceneDepth = nullptr;
 static float sceneView[16]{}, sceneProjection[16]{};
 static bool sceneCameraValid = false;
 static bool cameraReprojection = true;
+static bool smaaEnabled = true;
+static SmaaPipeline smaa;
 template <class T> void drop(T *&p) {
     if (p) {
         p->Release();
@@ -113,11 +116,14 @@ static DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 static const char *code = R"(
 cbuffer Resolve:register(b0){float weight,valid,jitterX,jitterY;float blurStrength,reprojectionEnabled,depthThreshold,padding;row_major float4x4 inverseCurrent,previousClip;float4 previousJitter;};
 Texture2D<float4> scene:register(t0);Texture2D<float4> history:register(t1);
-Texture2D<float> currentDepth:register(t2);Texture2D<float> previousDepth:register(t3);SamplerState linearSampler:register(s0);
+Texture2D<float> currentDepth:register(t2);Texture2D<float> previousDepth:register(t3);
+Texture2D smaaWeights:register(t4);
+#define linearSampler LinearSampler
 float4 vs(uint id:SV_VertexID):SV_POSITION{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}
 float4 ps(float4 p:SV_POSITION):SV_TARGET{
  uint w,h;scene.GetDimensions(w,h);float2 uv=(p.xy+float2(jitterX,jitterY))/float2(w,h);
- float4 current=scene.SampleLevel(linearSampler,uv,0);float3 lo=current.rgb,hi=current.rgb;float3 left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb;
+ float4 current=scene.SampleLevel(linearSampler,uv,0);
+ if(padding>.5){float4 offset;SMAANeighborhoodBlendingVS(uv,offset);current=SMAANeighborhoodBlendingPS(uv,offset,scene,smaaWeights);}float3 lo=current.rgb,hi=current.rgb;float3 left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb;
  [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++){
   float3 c=scene.SampleLevel(linearSampler,uv+float2(x,y)/float2(w,h),0).rgb;lo=min(lo,c);hi=max(hi,c);if(y==0&&x==-1)left=c;if(y==0&&x==1)right=c;if(x==0&&y==-1)up=c;if(x==0&&y==1)down=c;
  }
@@ -185,8 +191,9 @@ static bool initialize(ID3D11DeviceContext *c) {
     drop(d1);
     for (int i = 0; i < 2 && ok; i++) {
         ID3DBlob *b = nullptr, *error = nullptr;
-        ok = SUCCEEDED(D3DCompile(code, strlen(code), "TemporalResolve", nullptr, nullptr,
-                                  i ? "ps" : "vs", i ? "ps_4_0" : "vs_4_0",
+        std::string combined = std::string(smaaLibrary) + code;
+        ok = SUCCEEDED(D3DCompile(combined.data(), combined.size(), "TemporalResolve", nullptr,
+                                  nullptr, i ? "ps" : "vs", i ? "ps_4_0" : "vs_4_0",
                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, &error));
         if (error)
             log((char *)error->GetBufferPointer());
@@ -290,6 +297,10 @@ static bool apply() {
     context->IASetInputLayout(nullptr);
     context->VSSetShader(vs, nullptr, 0);
     context->PSSetShader(ps, nullptr, 0);
+    bool spatial =
+        smaaEnabled && smaa.prepare(device, context, width, height, view, sampler, oldD, log);
+    context->OMSetRenderTargets(1, &target, nullptr);
+    context->PSSetShader(ps, nullptr, 0);
     if (!historyValid)
         context->CopyResource(history, copy);
     gpuTimer.split(context);
@@ -300,6 +311,7 @@ static bool apply() {
     values.resolve[3] = jitterY;
     values.options[0] = blurStrength;
     values.options[2] = .00005f;
+    values.options[3] = spatial ? 1.f : 0.f;
     bool reproject = false;
     if (!historyValid)
         cameraHistory.invalidate();
@@ -319,8 +331,14 @@ static bool apply() {
     static int reportedMode = -1;
     if (reportedMode != (int)reproject) {
         reportedMode = (int)reproject;
-        log(reproject ? "Camera reprojection active: GPU depth copies and history depth rejection."
-                      : "Camera reprojection unavailable: color-history fallback active.");
+        char message[256];
+        sprintf_s(message, "Camera reprojection %s: %s (camera=%d depth=%p).",
+                  reproject ? "active" : "unavailable",
+                  !cameraReprojection ? "disabled in config"
+                  : !sceneCameraValid ? "camera data unavailable"
+                                      : cameraHistory.status(),
+                  sceneCameraValid, sceneDepth);
+        log(message);
     }
     context->UpdateSubresource(params, 0, nullptr, &values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
@@ -329,9 +347,11 @@ static bool apply() {
     if (reproject)
         cameraHistory.bind(context);
     context->PSSetSamplers(0, 1, &sampler);
+    if (spatial)
+        smaa.bindResolve(context, sampler);
     oldD(context, 3, 0);
-    ID3D11ShaderResourceView *empty[4] = {};
-    context->PSSetShaderResources(0, 4, empty);
+    ID3D11ShaderResourceView *empty[5] = {};
+    context->PSSetShaderResources(0, 5, empty);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     context->CopyResource(history, source);
     if (reproject)
@@ -403,7 +423,7 @@ static void before(ID3D11DeviceContext *c) {
     preparedDraw.valid = true;
     memcpy(preparedDraw.projection, projection, 64);
     preparedDraw.viewport = vp;
-    if (!target) {
+    if (!target || !sceneDepth || !sceneCameraValid) {
         ID3D11Buffer *viewBuffer = nullptr;
         c->VSGetConstantBuffers(1, 1, &viewBuffer);
         float camera[16]{};
@@ -426,9 +446,23 @@ static void before(ID3D11DeviceContext *c) {
             memcpy(previousProjection, projection, 64);
             cameraKnown = true;
         }
-        context = c;
-        viewport = vp;
-        c->OMGetRenderTargets(1, &target, &sceneDepth);
+        ID3D11RenderTargetView *candidate = nullptr;
+        ID3D11DepthStencilView *candidateDepth = nullptr;
+        c->OMGetRenderTargets(1, &candidate, &candidateDepth);
+        // Early sky/preview draws can share the world buffer layout but have
+        // no depth target. Do not let them lock out the later world capture.
+        if (known && candidate && candidateDepth) {
+            drop(target);
+            drop(sceneDepth);
+            target = candidate;
+            sceneDepth = candidateDepth;
+            candidate = nullptr;
+            candidateDepth = nullptr;
+            context = c;
+            viewport = vp;
+        }
+        drop(candidate);
+        drop(candidateDepth);
     }
 }
 static ID3D11Buffer *jitter(ID3D11DeviceContext *c) {

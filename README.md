@@ -32,3 +32,9 @@ Fine-detail stabilization: opposing-neighbor peak/trough detection retains more 
 `CameraReprojection=1` enables the experiment. Set it to zero and restart for the color-history path, or reinstall the stable DLL built from `main` for complete rollback. F9 toggles all TAA. Keep `main` separate until live stability and timings have been assessed. The log reports whether camera reprojection actually activates.
 
 GPU tests verify actual camera-translated history lookup, previous-depth rejection, three depth formats, resizing, matrix inversion, singular-matrix rejection, original accumulation/fallback behavior, jitter-upload reuse, blur and state restoration. They do not establish in-game frame rate or full moving-object correctness.
+
+## SMAA + TAA test
+
+`SMAA=1` enables upstream SMAA 1x at the medium preset on the world color before HUD drawing. Edge detection and blending-weight calculation add two fullscreen passes; neighborhood blending is fused into the TAA resolve. This treats visible shadow edges as color edges and does not increase shadow resolution, add cascades, or change grass/model shadow placement. Set `SMAA=0` and restart for the reprojection-only comparison. SMAA is licensed independently; see THIRD_PARTY_NOTICES.md.
+
+The capture now waits for a depth-backed world draw instead of allowing an early sky/preview draw to lock out scene capture. D32/S8 depth targets are also supported. Logs identify camera-reprojection activation or a fallback reason, plus SMAA resource initialization. Live confirmation is required before claiming the fallback has been fixed on a user's installation.

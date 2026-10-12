@@ -9,6 +9,8 @@ int main() {
     taa::oldD = (taa::D)(*(void ***)c)[13];
     assert(taa::initialize(c));
     taa::blurStrength = 0;
+    taa::smaaEnabled = false;
+    assert(taa::smaa.initialize(d, taa::log));
     float invertible[16] = {2, 0, 0, 3, 0, 4, 0, -2, 0, 0, .5f, 7, 0, 0, 0, 1};
     float inverted[16], identity[16];
     assert(reprojection::inverse(invertible, inverted));
@@ -79,7 +81,7 @@ int main() {
     for (auto &buffer : nativeBuffers)
         taa::drop(buffer);
 
-    for (auto size : {std::pair<UINT, UINT>{1280, 720}, {1920, 1080}, {512, 512}}) {
+    for (auto size : {std::pair<UINT, UINT>{1280, 720}, {1920, 1080}, {512, 512}, {640, 480}}) {
         ID3D11Texture2D *t = nullptr, *staging = nullptr;
         ID3D11RenderTargetView *rt = nullptr;
         D3D11_TEXTURE2D_DESC td{};
@@ -103,16 +105,53 @@ int main() {
         depthDesc.MipLevels = depthDesc.ArraySize = depthDesc.SampleDesc.Count = 1;
         depthDesc.Format = size.first == 1280   ? DXGI_FORMAT_D24_UNORM_S8_UINT
                            : size.first == 1920 ? DXGI_FORMAT_D32_FLOAT
+                           : size.first == 640  ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
                                                 : DXGI_FORMAT_D16_UNORM;
         depthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
         assert(SUCCEEDED(d->CreateTexture2D(&depthDesc, nullptr, &depthTexture)));
         assert(SUCCEEDED(d->CreateDepthStencilView(depthTexture, nullptr, &depthView)));
         c->ClearDepthStencilView(depthView, D3D11_CLEAR_DEPTH, .5f, 0);
+        // An early world-layout draw without depth must not prevent a later
+        // draw from capturing the actual scene attachments and camera.
+        ID3D11Buffer *captureBuffers[6]{};
+        for (unsigned i = 0; i < 6; ++i) {
+            D3D11_BUFFER_DESC desc{};
+            desc.ByteWidth = sizes[i];
+            desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            assert(SUCCEEDED(d->CreateBuffer(&desc, nullptr, &captureBuffers[i])));
+        }
+        float captureView[16]{};
+        for (int i : {0, 5, 10, 15})
+            captureView[i] = 1;
+        captureView[11] = 10;
+        captureBuffers[0]->SetPrivateData(taa::cacheGuid, 64, cameraProjection);
+        captureBuffers[1]->SetPrivateData(taa::cacheGuid, 64, captureView);
+        c->VSSetConstantBuffers(0, 6, captureBuffers);
+        D3D11_VIEWPORT captureViewport{0, 0, (float)size.first, (float)size.second, 0, 1};
+        c->RSSetViewports(1, &captureViewport);
+        taa::drop(taa::target);
+        taa::drop(taa::sceneDepth);
+        taa::finished = false;
+        taa::sceneCameraValid = false;
+        c->OMSetRenderTargets(1, &rt, nullptr);
+        taa::before(c);
+        assert(!taa::target && !taa::sceneDepth);
+        c->OMSetRenderTargets(1, &rt, depthView);
+        taa::before(c);
+        assert(taa::target == rt && taa::sceneDepth == depthView && taa::sceneCameraValid);
+        taa::drop(taa::target);
+        taa::drop(taa::sceneDepth);
+        taa::sceneCameraValid = false;
+        c->OMSetRenderTargets(0, nullptr, nullptr);
+        c->VSSetConstantBuffers(0, 6, emptyBuffers);
+        for (auto &buffer : captureBuffers)
+            taa::drop(buffer);
+        int pattern = 0;
         auto resolve = [&](int low, int high, bool reproject = false) {
             std::vector<unsigned char> p(size.first * size.second * 4);
             for (UINT y = 0; y < size.second; y++)
                 for (UINT x = 0; x < size.first; x++) {
-                    int value = (x + y) % 2 ? high : low;
+                    int value = pattern == 1 ? (x > y ? high : low) : (x + y) % 2 ? high : low;
                     auto i = (y * size.first + x) * 4;
                     p[i] = p[i + 1] = p[i + 2] = (unsigned char)value;
                     p[i + 3] = 255;
@@ -155,6 +194,16 @@ int main() {
         taa::historyValid = false;
         assert(resolve(140, 140) == 140);
         taa::blurStrength = 0;
+        taa::smaaEnabled = true;
+        taa::historyValid = false;
+        assert(resolve(140, 140) == 140);
+        pattern = 1;
+        taa::historyValid = false;
+        int diagonal = resolve(0, 255);
+        assert(diagonal > 0 && diagonal < 255);
+        pattern = 0;
+        taa::smaaEnabled = false;
+        printf("SMAA fused resolve: diagonal edge=%d; uniform color preserved PASS\n", diagonal);
         // Actual depth-backed resolve: camera translation changes the history
         // coordinate; a newly exposed depth must reject that old surface.
         memset(taa::sceneView, 0, sizeof(taa::sceneView));

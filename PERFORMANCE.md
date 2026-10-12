@@ -15,3 +15,7 @@ Projection uploads are reused when all 64 bytes are identical. World-draw classi
 ## Camera-reprojection test branch
 
 No additional draw calls: depth reconstruction and history reprojection run inside the existing resolve shader. Added costs are two depth-texture reads per pixel, matrix arithmetic, bilinear history sampling, and GPU depth copies. Two depth textures consume approximately 16 MiB at 1080p with 32-bit depth. Actual timings require a live RX 6600 comparison. The TAA timer includes these operations in its second segment. Dynamic objects do not have object motion vectors in this first experiment.
+
+## SMAA fused resolve
+
+Adds two fullscreen passes at the medium preset, two RGBA8 render targets (about 16 MiB at 1080p), and small immutable area/search lookup textures. Neighborhood blending runs inside the existing TAA shader, with no separate color intermediate. The first timing segment now includes input copy, SMAA edge detection, and weights; the second includes reprojection/resolve and history copies. No shadow geometry replay, cascade or resolution increase. GPU tests verify diagonal edge blending and unchanged uniform colors across resize targets, plus recovery after an early depthless draw.

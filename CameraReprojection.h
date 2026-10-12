@@ -63,6 +63,7 @@ class CameraHistory {
     UINT width = 0, height = 0;
     DXGI_FORMAT family = DXGI_FORMAT_UNKNOWN;
     bool valid = false;
+    const char *statusText = "not prepared";
     float previousMatrix[16]{}, currentMatrix[16]{};
     float previousJitter[2]{}, currentJitter[2]{};
     template <class T> static void release(T *&p) {
@@ -84,12 +85,16 @@ class CameraHistory {
     ~CameraHistory() {
         clear();
     }
+    const char *status() const {
+        return statusText;
+    }
     void invalidate() {
         valid = false;
     }
     bool prepare(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11DepthStencilView *depth,
                  UINT w, UINT h, const float *matrix, Parameters &parameters) {
         if (!depth || !inverse(matrix, parameters.inverseCurrent)) {
+            statusText = !depth ? "missing scene depth" : "singular camera transform";
             invalidate();
             return false;
         }
@@ -99,6 +104,7 @@ class CameraHistory {
         HRESULT hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&source);
         release(resource);
         if (FAILED(hr)) {
+            statusText = "depth is not a 2D texture";
             invalidate();
             return false;
         }
@@ -106,6 +112,11 @@ class CameraHistory {
         source->GetDesc(&desc);
         DXGI_FORMAT typed = DXGI_FORMAT_UNKNOWN, typeless = DXGI_FORMAT_UNKNOWN;
         switch (desc.Format) {
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+            typeless = DXGI_FORMAT_R32G8X24_TYPELESS;
+            typed = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            break;
         case DXGI_FORMAT_D24_UNORM_S8_UINT:
         case DXGI_FORMAT_R24G8_TYPELESS:
             typeless = DXGI_FORMAT_R24G8_TYPELESS;
@@ -126,6 +137,9 @@ class CameraHistory {
         }
         if (typed == DXGI_FORMAT_UNKNOWN || desc.Width != w || desc.Height != h ||
             desc.SampleDesc.Count != 1 || desc.ArraySize != 1 || desc.MipLevels != 1) {
+            statusText = typed == DXGI_FORMAT_UNKNOWN ? "unsupported depth format"
+                         : desc.SampleDesc.Count != 1 ? "multisampled depth"
+                                                      : "depth dimensions/layout differ from scene";
             release(source);
             invalidate();
             return false;
@@ -146,6 +160,7 @@ class CameraHistory {
                 SUCCEEDED(device->CreateShaderResourceView(currentDepth, &view, &currentView)) &&
                 SUCCEEDED(device->CreateShaderResourceView(previousDepth, &view, &previousView));
             if (!ok) {
+                statusText = "depth texture/view allocation failed";
                 clear();
                 release(source);
                 return false;
@@ -168,6 +183,7 @@ class CameraHistory {
         memcpy(parameters.previous, previousMatrix, 64);
         memcpy(parameters.previousJitter, previousJitter, sizeof(previousJitter));
         parameters.options[1] = 1;
+        statusText = "active";
         return true;
     }
     void bind(ID3D11DeviceContext *context) {
