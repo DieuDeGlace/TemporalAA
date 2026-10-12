@@ -19,3 +19,5 @@ No additional draw calls: depth reconstruction and history reprojection run insi
 ## SMAA fused resolve
 
 Adds two fullscreen passes at the medium preset, two RGBA8 render targets (about 16 MiB at 1080p), and small immutable area/search lookup textures. Neighborhood blending runs inside the existing TAA shader, with no separate color intermediate. The first timing segment now includes input copy, SMAA edge detection, and weights; the second includes reprojection/resolve and history copies. No shadow geometry replay, cascade or resolution increase. GPU tests verify diagonal edge blending and unchanged uniform colors across resize targets, plus recovery after an early depthless draw.
+
+Multisampled scene depth needs a GPU compute resolve (8x8 thread groups) and a multisample depth copy. Resolution is unchanged, and there are no CPU depth reads. The nearest sample is written to a single-sample R32 depth texture for camera reprojection. Its memory and bandwidth costs scale with sample count. Actual overhead is not yet measured.
