@@ -26,4 +26,6 @@ The difference is small in this run; it is not a guaranteed zero-cost change or 
 
 The static slanted-edge test measures per-pixel variance across eight jitter phases after history warms up. WARP variance fell from 67.8996 to 14.7805 (78.23% lower); hardware results were similar. This measures a synthetic edge, not a percentage reduction of every in-game shimmer. Moving silhouettes leave no stale trail outside the current neighborhood in the test, and uniform colors remain unchanged.
 
+After installing build 44b12e0, the user reported "Steadier, FPS similar" in the requested gameplay comparison. This confirms an initial visible improvement without a reported FPS regression. No exact FPS readings or matched gameplay timestamp measurements were supplied; the hardware fixture above remains the quantitative cost comparison. The tested DLL stays installed, and main remains unchanged.
+
 Current gameplay logs for the accepted MoonandShadow build averaged 1.3324 ms GPU across 44 reported groups, including both shadow maps and receiver application. Those observations do not isolate the incremental cost of its latest model-shading correction: a comparison at the same camera and location would be required. The correction adds no pass and skips depth lookups on grazing model faces.
