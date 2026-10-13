@@ -183,14 +183,22 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
             if(x==0&&y==1)down=c;
         }
     float3 raw=history.Load(int3(p.xy,0)).rgb;
-    // History is bounded to this frame's neighborhood.
-    float3 old=clamp(raw,lo,hi);
+    // Bound history to this frame's neighborhood by moving it along the line
+    // toward this pixel's own color until it enters the box. The result is
+    // always a mix of two real colors. A per-channel clamp could instead land
+    // on a box corner no neighbor has, which showed as green/red/yellow/blue
+    // lines on edges once history was kept longer.
+    float3 offset=raw-current.rgb;
+    float3 room=offset>0?hi-current.rgb:lo-current.rgb;
+    float3 limits=abs(offset)>1e-5?saturate(room/offset):1;
+    float3 clipped=current.rgb+offset*min(limits.x,min(limits.y,limits.z));
+    float3 old=clipped;
     // Jitter only moves edge coverage within the local range, so history that
     // already lies inside the neighborhood is kept even when it differs from
     // this frame's pixel; rejecting that difference is what made strong edges
-    // shimmer. History the clamp had to move is a real change (motion,
+    // shimmer. History the clip had to move is a real change (motion,
     // disocclusion, lighting) and is released.
-    float outside=maxChannel(abs(raw-old));
+    float outside=maxChannel(abs(raw-clipped));
     float confidence=1-smoothstep(.02,.12,outside);
     // Edges and thin details carry the jitter's coverage changes; accumulate
     // them longer. Flat areas keep the configured history weight.
