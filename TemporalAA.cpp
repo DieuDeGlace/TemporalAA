@@ -92,7 +92,7 @@ static bool readBuffer(ID3D11Buffer *b, void *out, UINT n) {
 
 static bool enabled = true, internal = false, finished = false;
 // Settings (see TemporalAA.ini).
-static float historyWeight = .65f;
+static float historyWeight = .65f, edgeHistoryWeight = .90f;
 static float blurStrength = .12f, jitterScale = .75f;
 
 // What before() learned about the current draw, reused by jitter().
@@ -150,9 +150,9 @@ static DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 // ===========================================================================
 
 // vs: full-screen triangle from SV_VertexID. ps: blends this frame with the
-// clamped history, keeping more history on thin details.
+// clamped history, keeping more history on edges and thin details.
 static const char *code = R"(
-cbuffer Resolve:register(b0){float weight,valid,jitterX,jitterY;float blurStrength;float3 padding;};
+cbuffer Resolve:register(b0){float weight,valid,jitterX,jitterY;float blurStrength,edgeWeight;float2 padding;};
 Texture2D<float4> scene:register(t0);
 Texture2D<float4> history:register(t1);
 SamplerState linearSampler:register(s0);
@@ -182,21 +182,26 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
             if(x==0&&y==-1)up=c;
             if(x==0&&y==1)down=c;
         }
-    float3 old=history.Load(int3(p.xy,0)).rgb;
-    float disagreement=maxChannel(abs(old-current.rgb));
-    // Opposing neighbors distinguish a thin peak/trough from a broad silhouette.
-    float3 lr=(left-current.rgb)*(right-current.rgb),ud=(up-current.rgb)*(down-current.rgb);
-    float thin=saturate(24*sqrt(max(0,max(max(lr.r,lr.g),max(lr.b,max(max(ud.r,ud.g),ud.b))))));
-    // Jitter changes edge coverage within the local contrast range. Preserve
-    // bounded history on those silhouettes, but still reject large raw changes.
-    // Flat newly revealed areas retain the original rejection threshold.
-    float rejection=max(lerp(.16,.30,thin),.60*maxChannel(hi-lo));
-    float confidence=1-smoothstep(.035,rejection,disagreement);
-    float accumulation=lerp(weight,max(weight,.78),thin);
-    // History is bounded to this frame's neighborhood and rejected on changes.
+    float3 raw=history.Load(int3(p.xy,0)).rgb;
+    // History is bounded to this frame's neighborhood.
+    float3 old=clamp(raw,lo,hi);
+    // Jitter only moves edge coverage within the local range, so history that
+    // already lies inside the neighborhood is kept even when it differs from
+    // this frame's pixel; rejecting that difference is what made strong edges
+    // shimmer. History the clamp had to move is a real change (motion,
+    // disocclusion, lighting) and is released.
+    float outside=maxChannel(abs(raw-old));
+    float confidence=1-smoothstep(.02,.12,outside);
+    // Edges and thin details carry the jitter's coverage changes; accumulate
+    // them longer. Flat areas keep the configured history weight.
+    float edge=smoothstep(.04,.20,maxChannel(hi-lo));
+    float accumulation=lerp(weight,max(weight,edgeWeight),edge)*valid*confidence;
     float3 filtered=lerp(current.rgb,(current.rgb*4+left+right+up+down)/8,blurStrength);
-    old=clamp(old,lo,hi);
-    return float4(lerp(filtered,old,accumulation*valid*confidence),current.a);
+    // Luminance-weighted blend (Karis): bright samples cannot dominate the
+    // average across jitter phases, which steadies bright/dark edges.
+    float currentWeight=(1-accumulation)/(1+maxChannel(filtered));
+    float historyWeight=accumulation/(1+maxChannel(old));
+    return float4((filtered*currentWeight+old*historyWeight)/(currentWeight+historyWeight),current.a);
 })";
 
 // Halton low-discrepancy sequence in [0, 1).
@@ -357,8 +362,8 @@ static bool apply() {
     if (!historyValid)
         context->CopyResource(history, copy);
     gpuTimer.split(context);
-    float values[8] = {
-        historyWeight, historyValid ? 1.f : 0.f, jitterX, jitterY, blurStrength, 0, 0, 0};
+    float values[8] = {historyWeight, historyValid ? 1.f : 0.f, jitterX, jitterY, blurStrength,
+                       edgeHistoryWeight, 0, 0};
     context->UpdateSubresource(params, 0, nullptr, values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
     ID3D11ShaderResourceView *inputs[] = {view, historyView};
@@ -618,6 +623,10 @@ static void loadSettings() {
     enabled = GetPrivateProfileIntW(L"TAA", L"Enabled", 1, ini) != 0;
     historyWeight =
         std::clamp((int)GetPrivateProfileIntW(L"TAA", L"HistoryPercent", 65, ini), 0, 85) * .01f;
+    // History kept on edges/thin details, where jitter alone changes coverage.
+    edgeHistoryWeight =
+        std::clamp((int)GetPrivateProfileIntW(L"TAA", L"EdgeHistoryPercent", 90, ini), 0, 95) *
+        .01f;
     blurStrength =
         std::clamp((int)GetPrivateProfileIntW(L"TAA", L"BlurPercent", 12, ini), 0, 40) * .01f;
     jitterScale =
