@@ -19,12 +19,14 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include "GpuPassTimer.h"
+#include "CameraReprojection.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
 namespace taa {
 static GpuPassTimer gpuTimer;
+static reprojection::CameraHistory cameraHistory;
 template <class T> void drop(T *&p) {
     if (p) {
         p->Release();
@@ -94,6 +96,9 @@ static bool enabled = true, internal = false, finished = false;
 // Settings (see TemporalAA.ini).
 static float historyWeight = .65f, edgeHistoryWeight = .90f;
 static float blurStrength = .12f, jitterScale = .75f;
+// Sample history where each surface was last frame (from scene depth and the
+// camera) instead of at the same screen pixel. See CameraReprojection.h.
+static bool cameraReprojection = true;
 
 // What before() learned about the current draw, reused by jitter().
 struct PreparedDraw {
@@ -132,11 +137,23 @@ static ID3DDeviceContextState *state = nullptr; // Isolated pipeline state for o
 static ID3D11Texture2D *copy = nullptr;         // This frame's scene, as shader input.
 static ID3D11ShaderResourceView *view = nullptr;
 static ID3D11RenderTargetView *target = nullptr; // The scene target of this frame.
+static ID3D11DepthStencilView *sceneDepth = nullptr; // ...and its depth buffer.
+// Native (unjittered) camera of this frame's world draws, for reprojection.
+static float sceneView[16]{}, sceneProjection[16]{};
+static bool sceneCameraValid = false;
 static D3D11_VIEWPORT viewport{};
 static ID3D11VertexShader *vs = nullptr;
 static ID3D11PixelShader *ps = nullptr;
 static ID3D11Buffer *params = nullptr;
 static ID3D11RasterizerState *raster = nullptr;
+// Resolve shader constants (cbuffer Resolve).
+struct ResolveParameters {
+    float weight, valid, jitterX, jitterY;
+    float blurStrength, edgeWeight, reproject, depthTolerance;
+    float clipToPrevious[16];
+    float previousJitter[4];
+};
+static_assert(sizeof(ResolveParameters) == 112, "matches cbuffer Resolve");
 static DI oldDI = nullptr;
 static D oldD = nullptr;
 // Camera of the previous frame: a cut or zoom invalidates history.
@@ -149,12 +166,20 @@ static DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 // Resolve shader
 // ===========================================================================
 
-// vs: full-screen triangle from SV_VertexID. ps: blends this frame with the
-// clamped history, keeping more history on edges and thin details.
+// vs: full-screen triangle from SV_VertexID. ps: blends this frame with
+// history found where this pixel's surface was last frame (camera
+// reprojection from scene depth), bounded to this frame's neighborhood.
 static const char *code = R"(
-cbuffer Resolve:register(b0){float weight,valid,jitterX,jitterY;float blurStrength,edgeWeight;float2 padding;};
+cbuffer Resolve:register(b0){
+    float weight,valid,jitterX,jitterY;
+    float blurStrength,edgeWeight,reproject,depthTolerance;
+    row_major float4x4 clipToPrevious; // Current jittered clip -> previous jittered clip.
+    float4 previousJitter;             // xy: last frame's jitter in pixels.
+};
 Texture2D<float4> scene:register(t0);
 Texture2D<float4> history:register(t1);
+Texture2D<float> depth:register(t2);
+Texture2D<float> previousDepth:register(t3);
 SamplerState linearSampler:register(s0);
 
 float4 vs(uint id:SV_VertexID):SV_POSITION{
@@ -163,10 +188,28 @@ float4 vs(uint id:SV_VertexID):SV_POSITION{
 }
 
 float maxChannel(float3 value){return max(value.r,max(value.g,value.b));}
+
+// Catmull-Rom history lookup in five bilinear taps (the four corner taps have
+// negligible weight). Unlike one bilinear tap it does not soften the image a
+// little more on every frame of camera motion.
+float3 historyAt(float2 uv,float2 size){
+    float2 position=uv*size,center=floor(position-.5)+.5,f=position-center;
+    float2 w0=f*(-.5+f*(1-.5*f)),w1=1+f*f*(-2.5+1.5*f),w2=f*(.5+f*(2-1.5*f)),w3=f*f*(-.5+.5*f);
+    float2 w12=w1+w2,t0=(center-1)/size,t3=(center+2)/size,t12=(center+w2/w12)/size;
+    float3 sum=history.SampleLevel(linearSampler,float2(t12.x,t0.y),0).rgb*(w12.x*w0.y)
+              +history.SampleLevel(linearSampler,float2(t0.x,t12.y),0).rgb*(w0.x*w12.y)
+              +history.SampleLevel(linearSampler,t12,0).rgb*(w12.x*w12.y)
+              +history.SampleLevel(linearSampler,float2(t3.x,t12.y),0).rgb*(w3.x*w12.y)
+              +history.SampleLevel(linearSampler,float2(t12.x,t3.y),0).rgb*(w12.x*w3.y);
+    float total=w12.x*w0.y+w0.x*w12.y+w12.x*w12.y+w3.x*w12.y+w12.x*w3.y;
+    return max(sum/total,0); // The negative lobes can undershoot at hard edges.
+}
+
 float4 ps(float4 p:SV_POSITION):SV_TARGET{
     uint w,h;
     scene.GetDimensions(w,h);
-    float2 uv=(p.xy+float2(jitterX,jitterY))/float2(w,h);
+    float2 size=float2(w,h);
+    float2 uv=(p.xy+float2(jitterX,jitterY))/size;
     float4 current=scene.SampleLevel(linearSampler,uv,0);
     float3 lo=current.rgb,hi=current.rgb;
     float3 left=current.rgb,right=current.rgb,up=current.rgb,down=current.rgb;
@@ -174,7 +217,7 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
         [unroll]for(int x=-1;x<=1;x++){
             // The center is already fetched above; reuse it instead of sampling twice.
             if(x==0&&y==0)continue;
-            float3 c=scene.SampleLevel(linearSampler,uv+float2(x,y)/float2(w,h),0).rgb;
+            float3 c=scene.SampleLevel(linearSampler,uv+float2(x,y)/size,0).rgb;
             lo=min(lo,c);
             hi=max(hi,c);
             if(y==0&&x==-1)left=c;
@@ -182,7 +225,38 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
             if(x==0&&y==-1)up=c;
             if(x==0&&y==1)down=c;
         }
-    float3 raw=history.Load(int3(p.xy,0)).rgb;
+    float accepted=valid;
+    float3 raw;
+    [branch]if(reproject>.5){
+        // Use the nearest depth of a small cross, so a silhouette's edge pixels
+        // follow the foreground surface instead of smearing it over the background.
+        int2 pixel=clamp(int2(uv*size),int2(0,0),int2(w,h)-1),nearest=pixel;
+        float d=depth.Load(int3(pixel,0));
+        const int2 cross[4]={int2(-1,0),int2(1,0),int2(0,-1),int2(0,1)};
+        [unroll]for(int i=0;i<4;i++){
+            int2 q=clamp(pixel+cross[i],int2(0,0),int2(w,h)-1);
+            float dq=depth.Load(int3(q,0));
+            if(dq<d){d=dq;nearest=q;}
+        }
+        float2 nearestUV=(float2(nearest)+.5)/size;
+        // Sky/far-plane pixels still reproject: that corrects camera rotation.
+        float4 previous=mul(clipToPrevious,float4(nearestUV*float2(2,-2)+float2(-1,1),d,1));
+        float3 previousNdc=previous.xyz/max(previous.w,1e-8);
+        float2 motion=previousNdc.xy*float2(.5,-.5)+.5-nearestUV;
+        // Last frame's jittered position of this surface, then its resolved
+        // (unjittered) history coordinate.
+        float2 previousUV=uv+motion;
+        float2 historyUV=previousUV-previousJitter.xy/size;
+        bool inside=previous.w>0&&all(historyUV>=0)&&all(historyUV<=1);
+        // Reject history for surfaces that were hidden or elsewhere last frame.
+        int2 previousPixel=clamp(int2(previousUV*size),int2(0,0),int2(w,h)-1);
+        float previousSurface=previousDepth.Load(int3(previousPixel,0));
+        float tolerance=depthTolerance+4*(abs(ddx(previousNdc.z))+abs(ddy(previousNdc.z)));
+        bool sameSurface=d>=.99999||abs(previousSurface-previousNdc.z)<=tolerance;
+        accepted*=inside&&sameSurface?1:0;
+        raw=historyAt(saturate(historyUV),size);
+    }else
+        raw=history.Load(int3(p.xy,0)).rgb;
     // Bound history to this frame's neighborhood by moving it along the line
     // toward this pixel's own color until it enters the box. The result is
     // always a mix of two real colors. A per-channel clamp could instead land
@@ -191,19 +265,18 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
     float3 offset=raw-current.rgb;
     float3 room=offset>0?hi-current.rgb:lo-current.rgb;
     float3 limits=abs(offset)>1e-5?saturate(room/offset):1;
-    float3 clipped=current.rgb+offset*min(limits.x,min(limits.y,limits.z));
-    float3 old=clipped;
+    float3 old=current.rgb+offset*min(limits.x,min(limits.y,limits.z));
     // Jitter only moves edge coverage within the local range, so history that
     // already lies inside the neighborhood is kept even when it differs from
     // this frame's pixel; rejecting that difference is what made strong edges
     // shimmer. History the clip had to move is a real change (motion,
     // disocclusion, lighting) and is released.
-    float outside=maxChannel(abs(raw-clipped));
+    float outside=maxChannel(abs(raw-old));
     float confidence=1-smoothstep(.02,.12,outside);
     // Edges and thin details carry the jitter's coverage changes; accumulate
     // them longer. Flat areas keep the configured history weight.
     float edge=smoothstep(.04,.20,maxChannel(hi-lo));
-    float accumulation=lerp(weight,max(weight,edgeWeight),edge)*valid*confidence;
+    float accumulation=lerp(weight,max(weight,edgeWeight),edge)*accepted*confidence;
     float3 filtered=lerp(current.rgb,(current.rgb*4+left+right+up+down)/8,blurStrength);
     // Luminance-weighted blend (Karis): bright samples cannot dominate the
     // average across jitter phases, which steadies bright/dark edges.
@@ -228,6 +301,8 @@ static void reset() {
     if (!finished) // The previous frame never resolved.
         historyValid = false;
     drop(target);
+    drop(sceneDepth);
+    sceneCameraValid = false;
     finished = false;
     frame++;
     jitterX = (halton(frame % 8 + 1, 2) - .5f) * jitterScale;
@@ -266,7 +341,7 @@ static bool initialize(ID3D11DeviceContext *c) {
         drop(error);
     }
     D3D11_BUFFER_DESC cb{};
-    cb.ByteWidth = 32;
+    cb.ByteWidth = sizeof(ResolveParameters);
     cb.Usage = D3D11_USAGE_DEFAULT;
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (ok)
@@ -321,6 +396,32 @@ static bool texture(ID3D11Texture2D *source, DXGI_FORMAT typed) {
 // Resolve pass
 // ===========================================================================
 
+// Copies scene depth and fills the reprojection constants for this frame.
+static bool prepareReprojection(ResolveParameters &values) {
+    double viewProjection[16];
+    reprojection::jitteredViewProjection(sceneProjection, sceneView, jitterX, jitterY,
+                                         viewport.Width, viewport.Height, viewProjection);
+    float jitter[2] = {jitterX, jitterY};
+    if (!cameraHistory.prepare(device, context, sceneDepth, width, height, viewProjection, jitter,
+                               values.clipToPrevious, values.previousJitter))
+        return false;
+    values.reproject = 1;
+    return true;
+}
+// Logs when reprojection starts or stops being used, with the reason.
+static void reportReprojection(bool active) {
+    static int reported = -1;
+    if (reported == (int)active)
+        return;
+    reported = (int)active;
+    char message[192];
+    sprintf_s(message, "Camera reprojection %s: %s.", active ? "active" : "unavailable",
+              !cameraReprojection  ? "disabled in TemporalAA.ini"
+              : !sceneCameraValid ? "no world camera this frame"
+                                  : cameraHistory.status());
+    log(message);
+}
+
 // Resolves the jittered scene in `target` against history (once per frame) in
 // an isolated device-context state, then stores the result as new history.
 static bool apply() {
@@ -367,21 +468,42 @@ static bool apply() {
     context->IASetInputLayout(nullptr);
     context->VSSetShader(vs, nullptr, 0);
     context->PSSetShader(ps, nullptr, 0);
-    if (!historyValid)
+    if (!historyValid) {
         context->CopyResource(history, copy);
+        cameraHistory.invalidate();
+    }
     gpuTimer.split(context);
-    float values[8] = {historyWeight, historyValid ? 1.f : 0.f, jitterX, jitterY, blurStrength,
-                       edgeHistoryWeight, 0, 0};
-    context->UpdateSubresource(params, 0, nullptr, values, 0, 0);
+    ResolveParameters values{};
+    values.weight = historyWeight;
+    values.valid = historyValid ? 1.f : 0.f;
+    values.jitterX = jitterX;
+    values.jitterY = jitterY;
+    values.blurStrength = blurStrength;
+    values.edgeWeight = edgeHistoryWeight;
+    values.depthTolerance = .0005f;
+    bool reproject = cameraReprojection && sceneCameraValid && prepareReprojection(values);
+    if (!reproject)
+        cameraHistory.invalidate();
+    reportReprojection(reproject);
+    context->UpdateSubresource(params, 0, nullptr, &values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
     ID3D11ShaderResourceView *inputs[] = {view, historyView};
     context->PSSetShaderResources(0, 2, inputs);
+    if (reproject)
+        cameraHistory.bind(context, 2);
     context->PSSetSamplers(0, 1, &sampler);
     oldD(context, 3, 0); // Full-screen triangle.
-    ID3D11ShaderResourceView *empty[2] = {};
-    context->PSSetShaderResources(0, 2, empty);
+    ID3D11ShaderResourceView *empty[4] = {};
+    context->PSSetShaderResources(0, 4, empty);
     context->OMSetRenderTargets(0, nullptr, nullptr);
-    context->CopyResource(history, source);
+    // A multisampled target must be resolved; CopyResource between different
+    // sample counts is invalid and would silently leave history stale.
+    if (td.SampleDesc.Count > 1)
+        context->ResolveSubresource(history, 0, source, 0, rt.Format);
+    else
+        context->CopyResource(history, source);
+    if (reproject)
+        cameraHistory.commit(context);
     historyValid = true;
     context1->SwapDeviceContextState(saved, nullptr);
     gpuTimer.end(context);
@@ -468,12 +590,16 @@ static void beginFrame(ID3D11DeviceContext *c, const float *projection, const D3
     cameraKnown = true;
     context = c;
     viewport = vp;
-    // Only a target drawn with depth is the world scene.
-    ID3D11DepthStencilView *sceneDepth = nullptr;
+    // Only a target drawn with depth is the world scene; its depth and camera
+    // drive this frame's reprojection.
     c->OMGetRenderTargets(1, &target, &sceneDepth);
-    if (!sceneDepth)
+    if (!sceneDepth) {
         drop(target);
-    drop(sceneDepth);
+        return;
+    }
+    memcpy(sceneView, camera, 64);
+    memcpy(sceneProjection, projection, 64);
+    sceneCameraValid = true;
 }
 
 // Runs before every draw. A perspective draw with the native world layout is
@@ -639,6 +765,7 @@ static void loadSettings() {
         std::clamp((int)GetPrivateProfileIntW(L"TAA", L"BlurPercent", 12, ini), 0, 40) * .01f;
     jitterScale =
         std::clamp((int)GetPrivateProfileIntW(L"TAA", L"JitterPercent", 75, ini), 25, 100) * .01f;
+    cameraReprojection = GetPrivateProfileIntW(L"TAA", L"CameraReprojection", 1, ini) != 0;
 }
 
 // Hooks the shared ID3D11DeviceContext vtable (taken from a temporary device).
@@ -682,7 +809,9 @@ static void attach() {
     }
     if (ok) {
         table = v;
-        log("TemporalAA prototype enabled; F9 toggles. Jitter/history resolve, no motion-vector buffer.");
+        log(cameraReprojection
+                ? "TemporalAA enabled; F9 toggles. Depth-based camera reprojection requested."
+                : "TemporalAA enabled; F9 toggles. Same-pixel history (CameraReprojection=0).");
     }
     drop(c);
     drop(d);
