@@ -111,8 +111,13 @@ static PreparedDraw preparedDraw;
 static UINT frame = 0;
 static bool historyValid = false;
 static float jitterX = 0, jitterY = 0; // Current jitter in pixels.
-static ID3D11Texture2D *history = nullptr;
-static ID3D11ShaderResourceView *historyView = nullptr;
+// History is double-buffered: the resolve reads `history` and renders the new
+// history into `nextHistory` (single-sample), which is then shown in the scene
+// target with a one-tap blit and becomes `history`. This replaces resolving
+// the (multisampled) scene target back into history every frame.
+static ID3D11Texture2D *history = nullptr, *nextHistory = nullptr;
+static ID3D11ShaderResourceView *historyView = nullptr, *nextHistoryView = nullptr;
+static ID3D11RenderTargetView *historyTarget = nullptr, *nextHistoryTarget = nullptr;
 static ID3D11SamplerState *sampler = nullptr;
 static ID3D11Buffer *jitterBuffer = nullptr; // Our jittered projection constant buffer.
 static float uploadedProjection[16]{};
@@ -143,7 +148,7 @@ static float sceneView[16]{}, sceneProjection[16]{};
 static bool sceneCameraValid = false;
 static D3D11_VIEWPORT viewport{};
 static ID3D11VertexShader *vs = nullptr;
-static ID3D11PixelShader *ps = nullptr;
+static ID3D11PixelShader *ps = nullptr, *blit = nullptr;
 static ID3D11Buffer *params = nullptr;
 static ID3D11RasterizerState *raster = nullptr;
 // Resolve shader constants (cbuffer Resolve).
@@ -283,7 +288,11 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
     float currentWeight=(1-accumulation)/(1+maxChannel(filtered));
     float historyWeight=accumulation/(1+maxChannel(old));
     return float4((filtered*currentWeight+old*historyWeight)/(currentWeight+historyWeight),current.a);
-})";
+}
+
+// Shows the new history in the scene target (every sample of an MSAA pixel).
+float4 show(float4 p:SV_POSITION):SV_TARGET{return history.Load(int3(p.xy,0));}
+)";
 
 // Halton low-discrepancy sequence in [0, 1).
 static float halton(UINT i, UINT base) {
@@ -324,17 +333,19 @@ static bool initialize(ID3D11DeviceContext *c) {
         ok = SUCCEEDED(d1->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION,
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
-    for (int i = 0; i < 2 && ok; i++) {
-        bool pixel = i == 1;
+    for (int i = 0; i < 3 && ok; i++) {
+        bool pixel = i > 0;
+        const char *entry = i == 0 ? "vs" : i == 1 ? "ps" : "show";
         ID3DBlob *b = nullptr, *error = nullptr;
-        ok = SUCCEEDED(D3DCompile(code, strlen(code), "TemporalResolve", nullptr, nullptr,
-                                  pixel ? "ps" : "vs", pixel ? "ps_4_0" : "vs_4_0",
-                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, &error));
+        ok = SUCCEEDED(D3DCompile(code, strlen(code), "TemporalResolve", nullptr, nullptr, entry,
+                                  pixel ? "ps_4_0" : "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                  &b, &error));
         if (error)
             log((char *)error->GetBufferPointer());
         if (ok)
             ok = SUCCEEDED(pixel ? device->CreatePixelShader(b->GetBufferPointer(),
-                                                             b->GetBufferSize(), nullptr, &ps)
+                                                             b->GetBufferSize(), nullptr,
+                                                             i == 1 ? &ps : &blit)
                                  : device->CreateVertexShader(b->GetBufferPointer(),
                                                               b->GetBufferSize(), nullptr, &vs));
         drop(b);
@@ -373,7 +384,11 @@ static bool texture(ID3D11Texture2D *source, DXGI_FORMAT typed) {
     drop(view);
     drop(copy);
     drop(historyView);
+    drop(historyTarget);
     drop(history);
+    drop(nextHistoryView);
+    drop(nextHistoryTarget);
+    drop(nextHistory);
     historyValid = false;
     width = d.Width;
     height = d.Height;
@@ -386,10 +401,16 @@ static bool texture(ID3D11Texture2D *source, DXGI_FORMAT typed) {
     d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     d.CPUAccessFlags = 0;
     d.MiscFlags = 0;
-    return SUCCEEDED(device->CreateTexture2D(&d, nullptr, &copy)) &&
-           SUCCEEDED(device->CreateShaderResourceView(copy, nullptr, &view)) &&
-           SUCCEEDED(device->CreateTexture2D(&d, nullptr, &history)) &&
-           SUCCEEDED(device->CreateShaderResourceView(history, nullptr, &historyView));
+    if (FAILED(device->CreateTexture2D(&d, nullptr, &copy)) ||
+        FAILED(device->CreateShaderResourceView(copy, nullptr, &view)))
+        return false;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    return SUCCEEDED(device->CreateTexture2D(&d, nullptr, &history)) &&
+           SUCCEEDED(device->CreateShaderResourceView(history, nullptr, &historyView)) &&
+           SUCCEEDED(device->CreateRenderTargetView(history, nullptr, &historyTarget)) &&
+           SUCCEEDED(device->CreateTexture2D(&d, nullptr, &nextHistory)) &&
+           SUCCEEDED(device->CreateShaderResourceView(nextHistory, nullptr, &nextHistoryView)) &&
+           SUCCEEDED(device->CreateRenderTargetView(nextHistory, nullptr, &nextHistoryTarget));
 }
 
 // ===========================================================================
@@ -452,14 +473,14 @@ static bool apply() {
     internal = true;
     ID3DDeviceContextState *saved = nullptr;
     gpuTimer.begin(device, context, "Mods\\TemporalAA.log",
-                   "TAA (input copy/resolve + history copy)");
+                   "TAA (input copy/resolve + output)");
     context1->SwapDeviceContextState(state, &saved);
     // Copy (or MSAA-resolve) the scene so it can be read while writing `target`.
     if (td.SampleDesc.Count > 1)
         context->ResolveSubresource(copy, 0, source, 0, rt.Format);
     else
         context->CopyResource(copy, source);
-    context->OMSetRenderTargets(1, &target, nullptr);
+    context->OMSetRenderTargets(1, &nextHistoryTarget, nullptr);
     context->OMSetBlendState(nullptr, nullptr, ~0u);
     context->OMSetDepthStencilState(nullptr, 0);
     context->RSSetState(raster);
@@ -492,16 +513,20 @@ static bool apply() {
     if (reproject)
         cameraHistory.bind(context, 2);
     context->PSSetSamplers(0, 1, &sampler);
-    oldD(context, 3, 0); // Full-screen triangle.
+    oldD(context, 3, 0); // Full-screen triangle into the new history.
     ID3D11ShaderResourceView *empty[4] = {};
     context->PSSetShaderResources(0, 4, empty);
+    // Show it in the scene target; every sample of an MSAA pixel gets the
+    // same colour, exactly what resolving the target back into history saw.
+    context->OMSetRenderTargets(1, &target, nullptr);
+    context->PSSetShader(blit, nullptr, 0);
+    context->PSSetShaderResources(1, 1, &nextHistoryView);
+    oldD(context, 3, 0);
+    context->PSSetShaderResources(0, 4, empty);
     context->OMSetRenderTargets(0, nullptr, nullptr);
-    // A multisampled target must be resolved; CopyResource between different
-    // sample counts is invalid and would silently leave history stale.
-    if (td.SampleDesc.Count > 1)
-        context->ResolveSubresource(history, 0, source, 0, rt.Format);
-    else
-        context->CopyResource(history, source);
+    std::swap(history, nextHistory);
+    std::swap(historyView, nextHistoryView);
+    std::swap(historyTarget, nextHistoryTarget);
     if (reproject)
         cameraHistory.commit(context);
     historyValid = true;
@@ -752,6 +777,78 @@ static bool patch(void **slot, void *fn) {
     return true;
 }
 
+// ===========================================================================
+// Shader-readable scene depth
+// ===========================================================================
+
+// Reprojection needs this frame's depth in a shader. A depth target created
+// without a shader-resource binding must be copied every frame (a full
+// multisampled copy at 4-8x MSAA, the largest part of the pass). Like ReShade,
+// depth targets are created typeless with that binding added, so the depth is
+// read in place; depth-stencil views get the matching typed format. Depth
+// values, tests and stencil are unchanged.
+static bool readableDepth = true;
+constexpr UINT SLOT_CREATE_TEXTURE_2D = 5, SLOT_CREATE_DEPTH_STENCIL_VIEW = 10;
+using CreateTexture2D = HRESULT(STDMETHODCALLTYPE *)(ID3D11Device *, const D3D11_TEXTURE2D_DESC *,
+                                                     const D3D11_SUBRESOURCE_DATA *,
+                                                     ID3D11Texture2D **);
+using CreateDepthView = HRESULT(STDMETHODCALLTYPE *)(ID3D11Device *, ID3D11Resource *,
+                                                     const D3D11_DEPTH_STENCIL_VIEW_DESC *,
+                                                     ID3D11DepthStencilView **);
+static CreateTexture2D oldCreateTexture2D = nullptr;
+static CreateDepthView oldCreateDepthView = nullptr;
+
+static DXGI_FORMAT typedDepth(DXGI_FORMAT typeless) {
+    switch (typeless) {
+    case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_D32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_D16_UNORM;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+static HRESULT STDMETHODCALLTYPE createTexture2D(ID3D11Device *d, const D3D11_TEXTURE2D_DESC *desc,
+                                                 const D3D11_SUBRESOURCE_DATA *data,
+                                                 ID3D11Texture2D **out) {
+    DXGI_FORMAT typeless, readable;
+    if (readableDepth && desc && !data && out && (desc->BindFlags & D3D11_BIND_DEPTH_STENCIL) &&
+        !(desc->BindFlags & D3D11_BIND_SHADER_RESOURCE) && desc->ArraySize == 1 &&
+        desc->MipLevels == 1 && desc->Usage == D3D11_USAGE_DEFAULT && desc->Width >= 256 &&
+        reprojection::depthFormats(desc->Format, typeless, readable) &&
+        typedDepth(typeless) == desc->Format) {
+        D3D11_TEXTURE2D_DESC readableDesc = *desc;
+        readableDesc.Format = typeless;
+        readableDesc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+        if (SUCCEEDED(oldCreateTexture2D(d, &readableDesc, nullptr, out)))
+            return S_OK;
+    }
+    return oldCreateTexture2D(d, desc, data, out);
+}
+static HRESULT STDMETHODCALLTYPE createDepthView(ID3D11Device *d, ID3D11Resource *resource,
+                                                 const D3D11_DEPTH_STENCIL_VIEW_DESC *desc,
+                                                 ID3D11DepthStencilView **out) {
+    ID3D11Texture2D *texture = nullptr;
+    if (resource && (!desc || desc->Format == DXGI_FORMAT_UNKNOWN) &&
+        SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&texture))) {
+        D3D11_TEXTURE2D_DESC td{};
+        texture->GetDesc(&td);
+        drop(texture);
+        DXGI_FORMAT typed = typedDepth(td.Format);
+        if (typed != DXGI_FORMAT_UNKNOWN) {
+            D3D11_DEPTH_STENCIL_VIEW_DESC view{};
+            if (desc)
+                view = *desc;
+            else {
+                view.ViewDimension = td.SampleDesc.Count > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS
+                                                             : D3D11_DSV_DIMENSION_TEXTURE2D;
+            }
+            view.Format = typed;
+            return oldCreateDepthView(d, resource, &view, out);
+        }
+    }
+    return oldCreateDepthView(d, resource, desc, out);
+}
+
 static void loadSettings() {
     const wchar_t *ini = L".\\Mods\\TemporalAA.ini";
     enabled = GetPrivateProfileIntW(L"TAA", L"Enabled", 1, ini) != 0;
@@ -766,6 +863,8 @@ static void loadSettings() {
     jitterScale =
         std::clamp((int)GetPrivateProfileIntW(L"TAA", L"JitterPercent", 75, ini), 25, 100) * .01f;
     cameraReprojection = GetPrivateProfileIntW(L"TAA", L"CameraReprojection", 1, ini) != 0;
+    readableDepth = cameraReprojection &&
+                    GetPrivateProfileIntW(L"TAA", L"ReadableDepth", 1, ini) != 0;
 }
 
 // Hooks the shared ID3D11DeviceContext vtable (taken from a temporary device).
@@ -806,6 +905,15 @@ static void attach() {
             break;
         }
         done++;
+    }
+    // Device hooks for shader-readable depth (both or neither).
+    if (ok && readableDepth) {
+        auto dv = *(void ***)d;
+        oldCreateTexture2D = (CreateTexture2D)dv[SLOT_CREATE_TEXTURE_2D];
+        oldCreateDepthView = (CreateDepthView)dv[SLOT_CREATE_DEPTH_STENCIL_VIEW];
+        if (patch(dv + SLOT_CREATE_DEPTH_STENCIL_VIEW, (void *)createDepthView) &&
+            !patch(dv + SLOT_CREATE_TEXTURE_2D, (void *)createTexture2D))
+            patch(dv + SLOT_CREATE_DEPTH_STENCIL_VIEW, (void *)oldCreateDepthView);
     }
     if (ok) {
         table = v;

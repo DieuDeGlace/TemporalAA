@@ -123,7 +123,11 @@ class CameraHistory {
     ID3D11Texture2D *current = nullptr, *previous = nullptr, *multisampled = nullptr;
     ID3D11ShaderResourceView *currentView = nullptr, *previousView = nullptr,
                              *multisampledView = nullptr;
-    ID3D11UnorderedAccessView *resolvedUav = nullptr;
+    ID3D11UnorderedAccessView *resolvedUav = nullptr, *previousUav = nullptr;
+    // A scene depth texture that is already shader-readable (ReShade, or the
+    // device hook in TemporalAA.cpp) is read in place instead of copied.
+    ID3D11Texture2D *directSource = nullptr;
+    ID3D11ShaderResourceView *directView = nullptr;
     ID3D11ComputeShader *nearestSample = nullptr;
     UINT width = 0, height = 0, samples = 0, quality = 0;
     DXGI_FORMAT family = DXGI_FORMAT_UNKNOWN;
@@ -140,6 +144,9 @@ class CameraHistory {
     void clear() {
         release(multisampledView);
         release(resolvedUav);
+        release(previousUav);
+        release(directView);
+        release(directSource);
         release(multisampled);
         release(currentView);
         release(previousView);
@@ -153,6 +160,7 @@ class CameraHistory {
                   DXGI_FORMAT readable) {
         clear();
         bool msaa = desc.SampleDesc.Count > 1;
+        bool sourceReadable = (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
         desc.Format = typeless;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -162,8 +170,11 @@ class CameraHistory {
         bool ok = true;
         if (msaa) {
             view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
-            ok = SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &multisampled)) &&
-                 SUCCEEDED(device->CreateShaderResourceView(multisampled, &view, &multisampledView));
+            // Only a non-readable source needs a full multisampled copy.
+            if (!sourceReadable)
+                ok = SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &multisampled)) &&
+                     SUCCEEDED(device->CreateShaderResourceView(multisampled, &view,
+                                                                &multisampledView));
             // The nearest-sample resolve writes a single-sample float copy.
             desc.SampleDesc = {1, 0};
             desc.Format = view.Format = DXGI_FORMAT_R32_FLOAT;
@@ -175,14 +186,40 @@ class CameraHistory {
              SUCCEEDED(device->CreateShaderResourceView(current, &view, &currentView));
         if (msaa)
             ok = ok && SUCCEEDED(device->CreateUnorderedAccessView(current, nullptr, &resolvedUav));
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        // For MSAA both single-sample depth textures take the nearest-sample
+        // UAV, so commit() can swap them instead of copying.
+        if (!msaa)
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         ok = ok && SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &previous)) &&
              SUCCEEDED(device->CreateShaderResourceView(previous, &view, &previousView));
+        if (msaa)
+            ok = ok && SUCCEEDED(device->CreateUnorderedAccessView(previous, nullptr, &previousUav));
         if (!ok)
             clear();
         return ok;
     }
-    bool resolveNearest(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *source) {
+    // The source's own multisampled view when it is shader-readable.
+    ID3D11ShaderResourceView *sourceView(ID3D11Device *device, ID3D11Texture2D *source,
+                                         DXGI_FORMAT readable) {
+        D3D11_TEXTURE2D_DESC desc{};
+        source->GetDesc(&desc);
+        if (!(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE))
+            return nullptr;
+        if (source != directSource) {
+            release(directView);
+            release(directSource);
+            D3D11_SHADER_RESOURCE_VIEW_DESC view{};
+            view.Format = readable;
+            view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+            if (FAILED(device->CreateShaderResourceView(source, &view, &directView)))
+                return nullptr;
+            directSource = source;
+            source->AddRef();
+        }
+        return directView;
+    }
+    bool resolveNearest(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Texture2D *source,
+                        DXGI_FORMAT readable) {
         // D3D11 cannot ResolveSubresource a depth texture; keep the nearest sample.
         if (!nearestSample) {
             static const char *shader = R"(
@@ -203,9 +240,15 @@ Texture2DMS<float> source:register(t0);RWTexture2D<float> output:register(u0);
             if (FAILED(result))
                 return false;
         }
-        context->CopyResource(multisampled, source);
+        ID3D11ShaderResourceView *input = sourceView(device, source, readable);
+        if (!input) {
+            if (!multisampled)
+                return false;
+            context->CopyResource(multisampled, source);
+            input = multisampledView;
+        }
         context->CSSetShader(nearestSample, nullptr, 0);
-        context->CSSetShaderResources(0, 1, &multisampledView);
+        context->CSSetShaderResources(0, 1, &input);
         context->CSSetUnorderedAccessViews(0, 1, &resolvedUav, nullptr);
         context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
         ID3D11ShaderResourceView *noView = nullptr;
@@ -276,9 +319,10 @@ Texture2DMS<float> source:register(t0);RWTexture2D<float> output:register(u0);
         }
         bool copied = true;
         if (samples > 1)
-            copied = resolveNearest(device, context, source);
+            copied = resolveNearest(device, context, source, readable);
         else
             context->CopyResource(current, source);
+        bool inPlace = samples > 1 && directSource == source;
         release(source);
         if (!copied) {
             statusText = "multisample depth resolve unavailable";
@@ -302,7 +346,9 @@ Texture2DMS<float> source:register(t0);RWTexture2D<float> output:register(u0);
         }
         previousJitterOut[0] = previousJitter[0];
         previousJitterOut[1] = previousJitter[1];
-        statusText = samples > 1 ? "active (nearest-sample MSAA depth)" : "active";
+        statusText = samples == 1 ? "active"
+                     : inPlace    ? "active (nearest-sample MSAA depth, read in place)"
+                                  : "active (nearest-sample MSAA depth, copied)";
         return true;
     }
     void bind(ID3D11DeviceContext *context, UINT slot) {
@@ -310,16 +356,12 @@ Texture2DMS<float> source:register(t0);RWTexture2D<float> output:register(u0);
         context->PSSetShaderResources(slot, 2, views);
     }
     // After the resolve: this frame becomes the previous frame. Swapping the
-    // two depth textures avoids a full-size copy; the next prepare() rewrites
-    // `current`. (A multisampled UAV stays bound to `current` only, so MSAA
-    // depth is copied instead.)
-    void commit(ID3D11DeviceContext *context) {
-        if (samples > 1)
-            context->CopyResource(previous, current);
-        else {
-            std::swap(current, previous);
-            std::swap(currentView, previousView);
-        }
+    // two depth textures (and, for MSAA, their nearest-sample UAVs) avoids a
+    // full-size copy; the next prepare() rewrites `current`.
+    void commit(ID3D11DeviceContext *) {
+        std::swap(current, previous);
+        std::swap(currentView, previousView);
+        std::swap(resolvedUav, previousUav);
         memcpy(previousMatrix, currentMatrix, sizeof(previousMatrix));
         previousJitter[0] = currentJitter[0];
         previousJitter[1] = currentJitter[1];

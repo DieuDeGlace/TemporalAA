@@ -37,3 +37,20 @@ The edge-stability resolve still rejected history whenever it differed from the 
 History is now rejected only by how far the neighborhood clamp had to move it. History inside the current 3x3 range is a valid jittered average, and history outside it is a real change. Edges and thin details accumulate up to `EdgeHistoryPercent` (default 90). Flat areas keep `HistoryPercent`. Current and history are blended with luminance weights (Karis), so bright samples do not dominate across jitter phases. No textures, passes or samples are added.
 
 WARP static slanted-edge phase variance: 14.7805 (edge-stability) to 0.7492 (94.9% lower), and 67.8996 for the original main shader. The moving-silhouette (no stale trail beyond the neighborhood) and uniform-color checks pass unchanged. These are synthetic measurements; in-game appearance needs live confirmation.
+
+## MSAA depth and history copies, 2026-10-15
+
+Live logs showed about 1.8 ms per frame for the pass. `Tests/MsaaBenchmark` times one complete `apply()` on the game's configuration: RX 6600, D3D11 hardware device, 1920 x 1080, multisampled colour target and multisampled D24S8 depth, camera reprojection on, 120 timed frames.
+
+With reprojection off, the pass took about 0.19 ms at every sample count. Nearly all the remaining cost was copying the full multisampled depth buffer each frame, because the game's depth target cannot be bound as a shader resource.
+
+| Change | 4x MSAA median | 8x MSAA median |
+| --- | ---: | ---: |
+| Before | 1.204 ms | 2.019 ms |
+| History rendered into a second history texture, then blitted to the scene; depth textures swapped instead of copied | 1.137 ms | 1.952 ms |
+| Scene depth read in place (shader-readable depth target) | 0.359 ms | 0.531 ms |
+
+- Depth targets are created typeless with a shader-resource binding, as ReShade does, and depth-stencil views get the matching typed format. When the depth is already readable, reprojection reads it in place and the full multisampled copy is skipped. Depth values, tests and stencil are unchanged; `Tests/ReadableDepthTest` covers the hooks.
+- `ReadableDepth=0` keeps the previous copy path.
+- The resolve's inputs and arithmetic are unchanged, so the image is the same: every MSAA sample receives the resolved colour, exactly what resolving the target back into history used to read.
+- These are fixture timings, not gameplay FPS. Live `TemporalAA.log` timing should confirm them.
