@@ -1,5 +1,37 @@
 # GPU performance measurements
 
+## Draw-hook CPU work, 2026-10-15
+
+The `perf/taa-draw-hooks` branch retains the installed MSAA-copy optimization,
+camera reprojection and resolve shader. It fetches the native buffer bindings
+once per draw, retains the fetched projection for restoration, and caches the
+immutable layout descriptions. The cache retains six COM references to prevent
+address reuse after buffer destruction. Contents are still read on every draw;
+writing a new matrix into the same buffer never reuses stale projection data.
+
+`DrawHookBenchmark` measures 3,000 draw preparations/restorations per synthetic
+frame on a D3D11 hardware context, with 20 warmup frames and 120 measured frames.
+It excludes actual native draws, buffer-write hooks, companion mods and the
+fullscreen GPU pass. It is a CPU microbenchmark, not a gameplay FPS prediction.
+
+On this PC, sequential baseline (`d086630`) and candidate runs measured:
+
+| Layout | Baseline median CPU ms | Candidate median CPU ms | Baseline / candidate p95 ms |
+| --- | ---: | ---: | ---: |
+| Background | 0.3732 | 0.3155 | 0.3848 / 0.4628 |
+| Solid world | 0.4374 | 0.3553 | 0.4496 / 0.3682 |
+
+The solid-world median reduction is about 19%, or 0.0821 ms for this workload.
+Background p95 was noisier in the candidate run. This small isolated saving
+does not account for the user's full F9 FPS difference; live CPU/GPU logs and
+a matched view comparison remain necessary. No resolve shader or settings
+are changed by the draw-hook optimization.
+
+The mod now logs `Draw setup/restore CPU` in `Mods/TemporalAA.log`. One frame in
+60 is sampled and 30 completed samples are averaged. Native draw calls and
+buffer-write hooks are outside this timing. GPU pass timings remain separate;
+CPU and GPU timings overlap and must not simply be added into a frame cost.
+
 Made with AI assistance. These measurements retain the existing visual settings.
 
 The mod samples its GPU pass once every 60 executions using a four-slot timestamp-query ring. Results are polled with `D3D11_ASYNC_GETDATA_DONOTFLUSH`; unfinished samples are skipped without waiting. Disjoint timestamps are rejected. Logs report averages of ten completed samples in milliseconds.

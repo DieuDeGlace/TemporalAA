@@ -19,6 +19,8 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include "GpuPassTimer.h"
+#include "BufferLayout.h"
+#include "CpuHookTimer.h"
 #include "CameraReprojection.h"
 #include <algorithm>
 #include <cstdio>
@@ -26,6 +28,7 @@
 #include <unordered_map>
 namespace taa {
 static GpuPassTimer gpuTimer;
+static CpuHookTimer hookTimer;
 static reprojection::CameraHistory cameraHistory;
 template <class T> void drop(T *&p) {
     if (p) {
@@ -106,8 +109,10 @@ struct PreparedDraw {
     bool valid = false;   // ...and found a full-screen perspective scene draw.
     float projection[16]{};
     D3D11_VIEWPORT viewport{};
+    ID3D11Buffer *original = nullptr; // Owned until jitter() takes it or the next draw resets it.
 };
 static PreparedDraw preparedDraw;
+static BufferLayout bufferLayout;
 static UINT frame = 0;
 static bool historyValid = false;
 static float jitterX = 0, jitterY = 0; // Current jitter in pixels.
@@ -307,6 +312,7 @@ static float halton(UINT i, UINT base) {
 
 // Called once per presented frame: advances the jitter.
 static void reset() {
+    drop(preparedDraw.original);
     if (!finished) // The previous frame never resolved.
         historyValid = false;
     drop(target);
@@ -550,21 +556,8 @@ static bool apply() {
 // buffers (16, 320 and 48 bytes). Returns whether the matrix triplet is present
 // and sets `world` when the full solid-world layout is bound.
 static bool perspectiveLayout(ID3D11DeviceContext *c, bool &world) {
-    ID3D11Buffer *buffers[6]{};
-    c->VSGetConstantBuffers(0, 6, buffers);
-    const UINT sizes[] = {64, 64, 64, 16, 320, 48};
-    bool matrices = true;
-    world = true;
-    for (int i = 0; i < 6; ++i) {
-        D3D11_BUFFER_DESC description{};
-        if (buffers[i])
-            buffers[i]->GetDesc(&description);
-        if (i < 3)
-            matrices &= description.ByteWidth == 64;
-        world &= description.ByteWidth == sizes[i];
-        drop(buffers[i]);
-    }
-    return matrices;
+    BoundConstantBuffers buffers(c);
+    return bufferLayout.inspect(buffers.data(), world);
 }
 
 // A full-screen scene viewport (not a preview or a small render target).
@@ -631,15 +624,14 @@ static void beginFrame(ID3D11DeviceContext *c, const float *projection, const D3
 // "prepared" for jittering; an orthographic draw into the scene target means
 // the world is complete, so the resolve runs.
 static void before(ID3D11DeviceContext *c) {
+    drop(preparedDraw.original);
     preparedDraw.checked = true;
     preparedDraw.valid = false;
     if (!enabled || internal || finished)
         return;
-    ID3D11Buffer *b = nullptr;
-    c->VSGetConstantBuffers(0, 1, &b);
+    BoundConstantBuffers buffers(c);
     float projection[16]{};
-    bool known = readBuffer(b, projection, 64);
-    drop(b);
+    bool known = readBuffer(buffers[0], projection, 64);
     if (!known)
         return;
     bool orthographic = fabsf(projection[15]) > .5f;
@@ -657,7 +649,7 @@ static void before(ID3D11DeviceContext *c) {
         return;
     }
     bool world = false;
-    if (!perspectiveLayout(c, world))
+    if (!bufferLayout.inspect(buffers.data(), world))
         return;
     UINT n = 1;
     D3D11_VIEWPORT vp{};
@@ -665,6 +657,7 @@ static void before(ID3D11DeviceContext *c) {
     if (!sceneViewport(n, vp))
         return;
     preparedDraw.valid = true;
+    preparedDraw.original = buffers.take(0);
     memcpy(preparedDraw.projection, projection, 64);
     preparedDraw.viewport = vp;
     if (!world)
@@ -680,7 +673,11 @@ static ID3D11Buffer *jitter(ID3D11DeviceContext *c) {
     if (internal || !enabled || finished || (preparedDraw.checked && !preparedDraw.valid))
         return nullptr;
     ID3D11Buffer *b = nullptr;
-    c->VSGetConstantBuffers(0, 1, &b);
+    if (preparedDraw.valid && preparedDraw.original) {
+        b = preparedDraw.original;
+        preparedDraw.original = nullptr;
+    } else
+        c->VSGetConstantBuffers(0, 1, &b);
     float p[16]{};
     D3D11_VIEWPORT vp{};
     if (preparedDraw.valid) {
@@ -721,19 +718,29 @@ static ID3D11Buffer *jitter(ID3D11DeviceContext *c) {
 // ===========================================================================
 
 static void STDMETHODCALLTYPE di(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
-    before(c);
-    auto original = jitter(c);
+    ID3D11Buffer *original = nullptr;
+    {
+        CpuHookTimer::Scope timer(hookTimer);
+        before(c);
+        original = jitter(c);
+    }
     oldDI(c, n, s, b);
     if (original) {
+        CpuHookTimer::Scope timer(hookTimer);
         c->VSSetConstantBuffers(0, 1, &original);
         drop(original);
     }
 }
 static void STDMETHODCALLTYPE draw(ID3D11DeviceContext *c, UINT n, UINT s) {
-    before(c);
-    auto original = jitter(c);
+    ID3D11Buffer *original = nullptr;
+    {
+        CpuHookTimer::Scope timer(hookTimer);
+        before(c);
+        original = jitter(c);
+    }
     oldD(c, n, s);
     if (original) {
+        CpuHookTimer::Scope timer(hookTimer);
         c->VSSetConstantBuffers(0, 1, &original);
         drop(original);
     }
@@ -936,6 +943,7 @@ class TemporalAA : public GenericMod {
         taa::attach();
     }
     void OnPresent(IDXGISwapChain *, UINT, UINT) override {
+        taa::hookTimer.present("Mods\\TemporalAA.log");
         if (GetAsyncKeyState(VK_F9) & 1) {
             taa::enabled = !taa::enabled;
             taa::historyValid = false;
